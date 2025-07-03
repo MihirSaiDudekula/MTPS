@@ -259,9 +259,9 @@ void parse_http_request(char* buffer, struct http_request* req) {
 
     // Parse headers for keep-alive and content-length
     bool keep_alive = false;
+    (void)keep_alive; // Mark as intentionally unused for now
     int content_length = 0;
-    char* content_type = NULL;
-    char* content_length_hdr = NULL;
+    (void)content_length; // Mark as intentionally unused for now
     
     char* header_line = buffer;
     char* crlf = "\r\n";
@@ -299,30 +299,29 @@ void parse_http_request(char* buffer, struct http_request* req) {
     }
 
     // Parse content type
-    char* content_type = strstr(buffer, "Content-Type: ");
-    if (content_type) {
-        content_type += 14; // Skip past the "Content-Type: " part
-        char* content_type_end = strstr(content_type, "\r\n");
-        // Searches for the end of the header line (which in HTTP is always \r\n)
-
+    char* content_type_hdr = strstr(buffer, "Content-Type: ");
+    if (content_type_hdr) {
+        content_type_hdr += 14; // Skip past the "Content-Type: " part
+        char* content_type_end = strstr(content_type_hdr, "\r\n");
+        
         if (content_type_end) {
-            size_t len = MIN(content_type_end - content_type, sizeof(req->content_type) - 1);
-            strncpy(req->content_type, content_type, len);
+            size_t len = (size_t)MIN(content_type_end - content_type_hdr, (long)(sizeof(req->content_type) - 1));
+            strncpy(req->content_type, content_type_hdr, len);
             req->content_type[len] = '\0';
         }
-        // Computes the number of characters between the start of the value and the end of the line.similar to what we did before, copy into struct and string terminate
     }
 
     // Parse content length
-    content_length_hdr = strstr(buffer, "Content-Length: ");
-    if (content_length) {
-        content_length += 16;
+    char* content_length_hdr = strstr(buffer, "Content-Length: ");
+    if (content_length_hdr) {
+        content_length_hdr += 16; // Skip "Content-Length: "
         char* endptr;
-        req->content_length = strtoul(content_length, &endptr, 10);
-        if (endptr == content_length || req->content_length > MAX_ELEMENT_SIZE) {
+        unsigned long length = strtoul(content_length_hdr, &endptr, 10);
+        if (endptr == content_length_hdr || length > (unsigned long)MAX_ELEMENT_SIZE) {
             LOG_ERROR("Invalid content length");
             return;
         }
+        req->content_length = (size_t)length;
     }
 
     // Parse body
@@ -652,7 +651,7 @@ void* handle_client(void* arg) {
     parse_http_request(buffer, &req);
 
     // check if the request is too large, closes connection if so
-    if (req.content_length > config.max_element_size) {
+    if ((size_t)req.content_length > config.max_element_size) {
         // if request is too large
         LOG_ERROR("Request too large");
         send_error_response(client_socket, 413);
