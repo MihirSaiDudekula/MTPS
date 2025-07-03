@@ -131,16 +131,31 @@ class PerformanceTester:
         data_size = 0
         
         try:
+            # Set default headers if none provided
+            if headers is None:
+                headers = {'User-Agent': 'PerformanceTester/1.0'}
+                
+            # Add Content-Type for POST/PUT if not specified
+            if method.upper() in ['POST', 'PUT', 'PATCH'] and 'Content-Type' not in headers:
+                headers['Content-Type'] = 'application/json'
+            
             # Execute the appropriate HTTP method
             method = method.upper()
-            if method == 'GET':
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method == 'POST':
-                response = requests.post(url, json=data, headers=headers, timeout=10)
-            elif method == 'DELETE':
-                response = requests.delete(url, headers=headers, timeout=10)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+            request_kwargs = {
+                'url': url,
+                'headers': headers,
+                'timeout': 30,  # Increased timeout for large file transfers
+                'allow_redirects': True
+            }
+            
+            # Add data/params based on method
+            if method in ['POST', 'PUT', 'PATCH']:
+                request_kwargs['json'] = data
+            elif method == 'GET' and data:
+                request_kwargs['params'] = data
+            
+            # Make the request
+            response = requests.request(method, **request_kwargs)
                 
             # Calculate response time in milliseconds
             response_time = (time.time() - start_time) * 1000
@@ -160,7 +175,20 @@ class PerformanceTester:
         except requests.exceptions.RequestException as e:
             # Handle request errors gracefully
             response_time = (time.time() - start_time) * 1000
-            logger.error(f"Request to {url} failed: {str(e)}")
+            error_type = type(e).__name__
+            
+            # Provide more detailed error information
+            if isinstance(e, requests.exceptions.Timeout):
+                error_msg = f"Request to {url} timed out after {e.timeout} seconds"
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                error_msg = f"Failed to connect to {url}: {str(e)}"
+            elif isinstance(e, requests.exceptions.HTTPError):
+                error_msg = f"HTTP error for {url}: {str(e)}"
+            else:
+                error_msg = f"Request to {url} failed: {str(e)}"
+            
+            logger.error(error_msg)
+            logger.debug(f"Error details: {error_type} - {str(e)}", exc_info=True)
             return (response_time, 0, False, False, 0)
     
     def _log_request(self, operation: str, target: str, response_time: float,
@@ -270,27 +298,39 @@ class PerformanceTester:
         
         # Execute tests either concurrently or sequentially based on the concurrent flag
         if concurrent:
-            logger.info("Running concurrent tests...")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Create a future for each test run
-                futures = [
-                    executor.submit(_test_single, target)
+            logger.info(f"Running concurrent tests with up to 10 workers for {num_requests} requests...")
+            # Use a ThreadPoolExecutor with a reasonable number of workers
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, num_requests * 2)) as executor:
+                # Submit all test runs to the executor
+                future_to_target = {
+                    executor.submit(_test_single, target): target
                     for target in ['direct', 'proxy']
                     for _ in range(num_requests)
-                ]
-                # Wait for all futures to complete
-                concurrent.futures.wait(futures)
+                }
                 
-                # Check for any exceptions in the completed futures
-                for future in futures:
+                # Process completed futures as they complete
+                for future in concurrent.futures.as_completed(future_to_target):
+                    target = future_to_target[future]
                     try:
                         future.result()  # This will raise any exceptions that occurred
                     except Exception as e:
-                        logger.error(f"Error in concurrent test: {str(e)}")
+                        logger.error(f"Error in concurrent test to {target}: {str(e)}")
+                        # Log the full traceback for debugging
+                        logger.debug("Full traceback:", exc_info=True)
+                        # Continue with other tests even if one fails
         else:
             logger.info("Running sequential tests...")
-            _test_single('direct')
-            _test_single('proxy')
+            try:
+                _test_single('direct')
+            except Exception as e:
+                logger.error(f"Error in direct test: {str(e)}")
+                logger.debug("Full traceback:", exc_info=True)
+                
+            try:
+                _test_single('proxy')
+            except Exception as e:
+                logger.error(f"Error in proxy test: {str(e)}")
+                logger.debug("Full traceback:", exc_info=True)
         
         # Calculate comprehensive statistics for the test run
         stats = {}
@@ -560,6 +600,14 @@ def parse_arguments():
         help='Output directory for test results and reports'
     )
     
+    # Add concurrent execution flag
+    parser.add_argument(
+        '--concurrent',
+        action='store_true',
+        help='Run tests concurrently for better performance',
+        default=True
+    )
+    
     # Parse and validate arguments
     args = parser.parse_args()
     
@@ -567,7 +615,7 @@ def parse_arguments():
     for url in [args.server, args.proxy]:
         if not (url.startswith('http://') or url.startswith('https://')):
             parser.error(f"URL must start with 'http://' or 'https://': {url}")
-    
+            
     return args
 
 def main():
@@ -647,7 +695,7 @@ def main():
                 method=test['method'],
                 data=test['data'],
                 num_requests=test['requests'],
-                concurrent=args.concurrent
+                concurrent=test.get('concurrent', args.concurrent)
             )
         
         # Generate comprehensive report
