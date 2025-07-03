@@ -24,6 +24,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdarg.h>     // For va_list, va_start, va_end
+#include <sys/time.h>   // For struct timeval
+#include <sys/select.h> // For select()
+#include <signal.h>     // For signal handling
 
 // A macro in C is a way to define a shortcut or code pattern that gets replaced by the preprocessor before the actual compilation happens
 // Error logging macro - provides consistent error reporting. when i call the LOG_ERROR() method, it willm
@@ -62,18 +66,20 @@ ProxyConfig config = {
  * @brief Statistics tracking for cache performance
  * Maintains counters for cache hits, misses, and current size
  */
-struct CacheStats {
+// Cache statistics structure
+typedef struct CacheStats {
     size_t total_hits;       // Number of cache hits
     size_t total_misses;     // Number of cache misses
     size_t current_size;     // Current cache size in bytes
     size_t max_size;         // Maximum allowed cache size
-} cache_stats;
+} CacheStats;
 
-cache_stats = {
+// Global cache statistics
+CacheStats cache_stats = {
     .total_hits = 0,
     .total_misses = 0,
     .current_size = 0,
-    .max_size = 0
+    .max_size = 200 * (1<<20)  // 200MB default max size
 };
 
 /**
@@ -168,6 +174,17 @@ bool validate_headers(const char* headers) {
     return true;
 }
 
+// Function prototypes
+void parse_http_request(char* buffer, struct http_request* req);
+int connect_to_server(const char* host, int port, int timeout_ms);
+void cache_invalidate(const char* url);
+bool cache_lookup(const char* url, struct cache_element** element);
+void cache_add(const char* url, const char* data, size_t len);
+void cache_cleanup();
+void* handle_client(void* arg);
+int send_error_response(int socket, int status_code);
+
+// HTTP Request parsing
 void parse_http_request(char* buffer, struct http_request* req) {
     // takes a raw HTTP request stored as a string (buffer) and extracts its components into a structured format (struct http_request* req). It performs basic parsing and validation step-by-step
 
@@ -221,8 +238,8 @@ void parse_http_request(char* buffer, struct http_request* req) {
     int content_length = 0;
     
     char* header_line = buffer;
-    while ((header_line = strstr(header_line, "\r
-")) != NULL) {
+    char* crlf = "\r\n";
+    while ((header_line = strstr(header_line, crlf)) != NULL) {
         *header_line = '\0';  // Null-terminate the header line
         header_line += 2;      // Move past "\r\n"
         
@@ -572,7 +589,9 @@ void* handle_client(void* arg) {
     sem_wait(&connection_semaphore);
 
     // Set socket timeout
-    struct timeval timeout = {30, 0}; // 30 seconds timeout
+    struct timeval timeout;
+    timeout.tv_sec = 30;  // 30 seconds
+    timeout.tv_usec = 0;
 
     // If no data is received in 30 seconds, the connection will be closed
     if (setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, 
@@ -766,7 +785,9 @@ void* handle_client(void* arg) {
         }
         
         // Set keep-alive timeout
-        struct timeval timeout = {30, 0}; // 30 seconds
+        struct timeval timeout;
+        timeout.tv_sec = 30;  // 30 seconds
+        timeout.tv_usec = 0;
         setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
         
         // Don't close the sockets, just return to handle the next request
@@ -816,7 +837,18 @@ int send_error_response(int socket, int status_code) {
     return send(socket, response, strlen(response), 0);
 }
 
+// Signal handler for graceful shutdown
+static volatile sig_atomic_t keep_running = 1;
+
+void handle_signal(int sig) {
+    (void)sig; // Unused parameter
+    keep_running = 0;
+}
+
 int main(int argc, char* argv[]) {
+    // Set up signal handlers for graceful shutdown
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
     // validate the inputs 
     if (argc != 2) {
@@ -869,7 +901,7 @@ int main(int argc, char* argv[]) {
 
     printf("Proxy server listening on port %d...\n", port);
 
-    while (1) {
+    while (keep_running) {
         // sockaddr is a structure that contains the address of the client coming from the socket library
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
