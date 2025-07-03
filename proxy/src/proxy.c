@@ -21,13 +21,37 @@
 #include <time.h>
 #include <errno.h>
 #include <ctype.h>
+#include <stdbool.h>
+#include <sys/select.h>
+#include <stdarg.h>
+#include <sys/time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <stdbool.h>
-#include <stdarg.h>     // For va_list, va_start, va_end
-#include <sys/time.h>   // For struct timeval
-#include <sys/select.h> // For select()
-#include <signal.h>     // For signal handling
+
+// Define strcasestr if not available
+#ifndef _GNU_SOURCE
+// Case-insensitive string search
+char* strcasestr(const char* haystack, const char* needle) {
+    if (!*needle) return (char*)haystack;
+    
+    for (; *haystack; ++haystack) {
+        const char* h = haystack;
+        const char* n = needle;
+        
+        while (tolower((unsigned char)*h) == tolower((unsigned char)*n) && *h && *n) {
+            ++h;
+            ++n;
+        }
+        
+        if (!*n) {
+            return (char*)haystack;
+        }
+    }
+    
+    return NULL;
+}
+#endif
 
 // A macro in C is a way to define a shortcut or code pattern that gets replaced by the preprocessor before the actual compilation happens
 // Error logging macro - provides consistent error reporting. when i call the LOG_ERROR() method, it willm
@@ -236,6 +260,8 @@ void parse_http_request(char* buffer, struct http_request* req) {
     // Parse headers for keep-alive and content-length
     bool keep_alive = false;
     int content_length = 0;
+    char* content_type = NULL;
+    char* content_length_hdr = NULL;
     
     char* header_line = buffer;
     char* crlf = "\r\n";
@@ -288,7 +314,7 @@ void parse_http_request(char* buffer, struct http_request* req) {
     }
 
     // Parse content length
-    char* content_length = strstr(buffer, "Content-Length: ");
+    content_length_hdr = strstr(buffer, "Content-Length: ");
     if (content_length) {
         content_length += 16;
         char* endptr;
@@ -377,7 +403,7 @@ int connect_to_server(const char* host, int port, int timeout_ms) {
     // specify IPv4 and port number, copy the IP address from the server into server_addr struct
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
-    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
 
     // Connect with timeout
     // connect function needs the socket file descriptor, pointer to a sockaddr structure and length
@@ -504,7 +530,10 @@ void cache_add(const char* url, const char* data, size_t len) {
     }
 
     // copy necessary data into new element
-    new_element->url = strdup(url);
+    new_element->url = (char*)malloc(strlen(url) + 1);
+    if (new_element->url) {
+        strcpy(new_element->url, url);
+    }
     new_element->data = malloc(len);
     if (!new_element->data) {
         // not enough memory
@@ -656,7 +685,7 @@ void* handle_client(void* arg) {
     
     // Check for keep-alive
     bool keep_alive = false;
-    char* connection_hdr = strcasestr(buffer, "Connection: ");
+    const char* connection_hdr = strcasestr(buffer, "Connection: ");
     if (connection_hdr) {
         char* end = strstr(connection_hdr, "\r\n");
         if (end) {
@@ -757,7 +786,7 @@ void* handle_client(void* arg) {
     // Handle keep-alive
     if (keep_alive) {
         // Look for Content-Length to determine if we need to read the body
-        char* content_length_hdr = strcasestr(response_buffer, "Content-Length: ");
+        const char* content_length_hdr = strcasestr(response_buffer, "Content-Length: ");
         if (content_length_hdr) {
             long content_length = strtol(content_length_hdr + 16, NULL, 10);
             if (content_length > 0) {
