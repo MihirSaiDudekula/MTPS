@@ -588,7 +588,7 @@ def main():
         # Parse command line arguments
         args = parse_arguments()
         
-        # Initialize the performance tester with user-provided settings
+        # Initialize the tester with command line arguments
         tester = PerformanceTester(
             server_url=args.server,
             proxy_url=args.proxy,
@@ -611,6 +611,15 @@ def main():
             
             # Standard API endpoint
             {'endpoint': 'test', 'method': 'GET', 'data': None, 'requests': 20},
+            
+            # Large file download test
+            {
+                'endpoint': f'large?size=10',  # 10MB file
+                'method': 'GET',
+                'data': None,
+                'requests': 3,
+                'concurrent': False
+            },
             
             # POST request with data
             {
@@ -662,7 +671,6 @@ def main():
         print(f"\n\nError during testing: {str(e)}")
         logging.error("Unhandled exception", exc_info=True)
         sys.exit(1)
-        logger.info(f"Results for {endpoint[0]}: {json.dumps(stats, indent=2)}")
     
     # Generate final report
     tester.generate_report()
@@ -670,7 +678,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-def test_large_request(num_requests: int = 3, size_mb: int = 10) -> None:
+def test_large_request(server_url: str, proxy_url: str, num_requests: int = 3, size_mb: int = 10) -> list:
     """
     Test the performance of large file downloads through both direct and proxy connections.
     
@@ -680,8 +688,13 @@ def test_large_request(num_requests: int = 3, size_mb: int = 10) -> None:
     - Caching effectiveness for large responses
     
     Args:
+        server_url (str): Base URL of the backend server
+        proxy_url (str): Base URL of the proxy server
         num_requests (int): Number of times to repeat the test (default: 3)
         size_mb (int): Size of the test file in megabytes (default: 10MB)
+        
+    Returns:
+        list: A list of dictionaries containing test results
         
     The test will download the specified file multiple times and report statistics
     for both direct and proxied connections.
@@ -764,35 +777,11 @@ def test_large_request(num_requests: int = 3, size_mb: int = 10) -> None:
                     print(f"  Size: {target_stats['size_mb'].mean():,.2f} MB")
                     print(f"  Speed: {target_stats['speed_mbps'].mean():,.2f} Mbps")
                     print(f"  Min Speed: {target_stats['speed_mbps'].min():,.2f} Mbps")
-                    print(f"  Max Speed: {target_stats['speed_mbps'].max():,.2f} Mbps")ponse.status_code}")
-                continue
-            
-            cache_hit = i > 0  # First request is always a cache miss
-            log_request(
-                f'large_request_{"cached" if cache_hit else "nocache"}', 
-{{ ... }}
-                elapsed_time, 
-                response.status_code,
-                cache_hit
-            )
-            
-            print(f"Request {i+1} time: {elapsed_time:.4f} seconds")
-            print(f"Response size: {len(response.content) / (1024 * 1024):.2f} MB")
-            
-            results.append({
-                'request_number': i + 1,
-                'time': elapsed_time,
-                'cache_hit': cache_hit,
-                'status_code': response.status_code
-            })
-            
-            # Add small delay between requests
-            time.sleep(0.5)
-        except requests.exceptions.RequestException as e:
-            print(f"✗ Request {i+1} failed: {str(e)}")
-            continue
+                    print(f"  Max Speed: {target_stats['speed_mbps'].max():,.2f} Mbps")
+            # Print divider between target types
+            print("\n" + "-" * 60)
     
-    return results
+    return all_stats
 
 def create_test_users(num_users=5):
     print(f"\nCreating {num_users} test users...")
