@@ -1,0 +1,4 @@
+# Python dependencies for the client
+# Add your Python dependencies here, for example:
+# requests>=2.25.1
+# python-dotenv>=0.15.0
