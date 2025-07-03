@@ -228,7 +228,7 @@ void parse_http_request(char* buffer, struct http_request* req) {
 
     // validation of the request method name, if we dont find the method name in the buffer
     // sizeof(req->method) is at max 16, so our req methods name cannot exceed 16
-    if (!space || space - buffer > sizeof(req->method)) {
+    if (!space || (size_t)(space - buffer) > sizeof(req->method) - 1) {
         LOG_ERROR("Invalid request method");
         return;
     }
@@ -245,7 +245,7 @@ void parse_http_request(char* buffer, struct http_request* req) {
     char* url_end = strchr(url_start, ' ');
     // look for the next space 
 
-    if (!url_end || url_end - url_start > sizeof(req->url)) {
+    if (!url_end || (size_t)(url_end - url_start) > sizeof(req->url) - 1) {
         LOG_ERROR("Invalid URL");
         return;
     }
@@ -789,23 +789,14 @@ void* handle_client(void* arg) {
         if (content_length_hdr) {
             long content_length = strtol(content_length_hdr + 16, NULL, 10);
             if (content_length > 0) {
-                // We've already read some data, calculate remaining
-                char* body_start = strstr(response_buffer, "\r\n\r\n");
-                if (body_start) {
-                    body_start += 4; // Skip past the header end
-                    size_t header_size = body_start - response_buffer;
-                    size_t body_read = total_received > header_size ? (total_received - header_size) : 0;
-                    
-                    // Read remaining body if needed
-                    while (body_read < (size_t)content_length) {
-                        ssize_t bytes = recv(server_socket, response_buffer, 
-                                          MIN(sizeof(response_buffer), content_length - body_read), 0);
-                        if (bytes <= 0) break;
-                        
-                        if (send(client_socket, response_buffer, bytes, 0) < 0) {
-                            LOG_ERROR("Failed to send remaining body to client");
-                            break;
-                        }
+                // Read and discard the body
+                char* body = malloc(content_length + 1);
+                if (body) {
+                    ssize_t bytes_read = 0;
+                    while (bytes_read < content_length) {
+                        ssize_t n = recv(client_socket, body + bytes_read, (size_t)MIN(content_length - bytes_read, sizeof(response_buffer)), 0);
+                        if (n <= 0) break;
+                        bytes_read += n;
                         body_read += bytes;
                     }
                 }
@@ -823,7 +814,15 @@ void* handle_client(void* arg) {
         sem_post(&connection_semaphore);
         
         // Recursively handle the next request on the same connection
-        handle_client(arg);
+        int* new_arg = malloc(sizeof(int));
+        if (new_arg) {
+            *new_arg = *((int*)arg);
+            free(arg);
+            handle_client(new_arg);
+        } else {
+            close(*((int*)arg));
+            free(arg);
+        }
         return NULL;
     }
     
