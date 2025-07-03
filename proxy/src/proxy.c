@@ -793,11 +793,12 @@ void* handle_client(void* arg) {
                 char* body = malloc(content_length + 1);
                 if (body) {
                     ssize_t bytes_read = 0;
+                    ssize_t total_bytes_read = 0;
                     while (bytes_read < content_length) {
-                        ssize_t n = recv(client_socket, body + bytes_read, (size_t)MIN(content_length - bytes_read, sizeof(response_buffer)), 0);
+                        ssize_t n = recv(client_socket, body + bytes_read, (size_t)MIN((size_t)(content_length - bytes_read), sizeof(response_buffer)), 0);
                         if (n <= 0) break;
                         bytes_read += n;
-                        body_read += bytes;
+                        total_bytes_read += n;
                     }
                 }
             }
