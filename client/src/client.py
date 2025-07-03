@@ -134,8 +134,17 @@ class PerformanceTester:
             # Set default headers if none provided
             if headers is None:
                 headers = {'User-Agent': 'PerformanceTester/1.0'}
-                
-            # Add Content-Type for POST/PUT if not specified
+            else:
+                # Create a shallow copy so we don't mutate the caller's dictionary
+                headers = dict(headers)
+
+            # Ensure backend Host header is present when making a request through the proxy.
+            # Some reverse proxies rely on the Host header when forwarding the request.
+            if target == 'proxy':
+                backend_host = self.server_url.split('://', 1)[-1]
+                headers.setdefault('Host', backend_host)
+
+            # Add Content-Type for payload-carrying methods if not already specified
             if method.upper() in ['POST', 'PUT', 'PATCH'] and 'Content-Type' not in headers:
                 headers['Content-Type'] = 'application/json'
             
@@ -162,7 +171,11 @@ class PerformanceTester:
             
             # Get response metadata
             data_size = len(response.content)
-            cache_hit = response.headers.get('X-Cache', '').lower() == 'hit'
+            # Detect cache hits from proxy response headers. The proxy uses the standard
+            # "X-Cache: HIT/MISS" header but we also check the commonly used
+            # "X-Proxy-Cache" header just in case.
+            cache_header = response.headers.get('X-Cache') or response.headers.get('X-Proxy-Cache') or ''
+            cache_hit = str(cache_header).lower().startswith('hit')
             
             return (
                 response_time,          # Time taken in milliseconds
@@ -542,24 +555,21 @@ def generate_report(self) -> None:
         summary.to_csv(summary_path, index=False)
         logger.info(f"Saved summary statistics to: {summary_path}")
         
-        # 3. Generate visualizations if we have enough data
-        self._generate_visualizations(df, summary)
+        # Generate visualizations
+        self._generate_plots(df)
+        
+        # Print summary to console
+        print("\n" + "="*50)
+        print("PERFORMANCE TEST SUMMARY")
+        print("="*50)
+        print(summary.to_string())
+        print("\nDetailed results saved to:", self.output_dir.absolute())
         
         logger.info("Report generation completed successfully")
         
     except Exception as e:
         logger.error(f"Error generating report: {str(e)}")
         raise
-        
-    # Generate visualizations
-    self._generate_plots(df)
-    
-    # Print summary
-    print("\n" + "="*50)
-    print("PERFORMANCE TEST SUMMARY")
-    print("="*50)
-    print(summary.to_string())
-    print("\nDetailed results saved to:", self.output_dir.absolute())
 
 def parse_arguments():
     """
