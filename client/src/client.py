@@ -123,7 +123,7 @@ class PerformanceTester:
                 - data_size (int): Size of the response data in bytes
                 
         Note:
-            - Times out after 10 seconds if no response is received
+            - Times out after 30 seconds if no response is received
             - Logs errors but doesn't raise exceptions to allow test continuation
         """
         start_time = time.time()
@@ -192,7 +192,7 @@ class PerformanceTester:
             
             # Provide more detailed error information
             if isinstance(e, requests.exceptions.Timeout):
-                error_msg = f"Request to {url} timed out after {e.timeout} seconds"
+                error_msg = f"Request to {url} timed out after 30 seconds"
             elif isinstance(e, requests.exceptions.ConnectionError):
                 error_msg = f"Failed to connect to {url}: {str(e)}"
             elif isinstance(e, requests.exceptions.HTTPError):
@@ -248,7 +248,7 @@ class PerformanceTester:
             method (str): HTTP method to use (GET, POST, etc.)
             data (dict, optional): Request payload for POST/PUT methods
             num_requests (int): Number of requests to send per target (direct/proxy)
-            concurrent (bool): Whether to run tests concurrently for better performance
+            run_concurrent (bool): Whether to run tests concurrently for better performance
             
         Returns:
             dict: A dictionary containing detailed performance statistics for both
@@ -274,75 +274,80 @@ class PerformanceTester:
             'proxy': f"{self.proxy_url}/{endpoint.lstrip('/')}"
         }
         
-        def _test_single(target: str) -> None:
+        def _test_single_request(target: str) -> Tuple[str, float, int, bool, bool, int]:
             """
-            Inner function to test a single target (direct or proxy).
+            Inner function to perform a single request.
             
             Args:
                 target (str): 'direct' or 'proxy' - indicates which URL to test
+                
+            Returns:
+                Tuple containing target and request metrics
             """
-            logger.debug(f"Testing {target} connection to {urls[target]}")
+            # Make the HTTP request and capture metrics
+            response_time, status_code, success, cache_hit, data_size = self._make_request(
+                urls[target], method, data, target=target
+            )
             
-            for i in range(num_requests):
-                # Make the HTTP request and capture metrics
-                response_time, status_code, success, cache_hit, data_size = self._make_request(
-                    urls[target], method, data, target=target
-                )
-                
-                # Log the request details
-                self._log_request(
-                    operation=endpoint,
-                    target=target,
-                    response_time=response_time,
-                    status_code=status_code,
-                    cache_hit=cache_hit,
-                    data_size=data_size
-                )
-                
-                # Update results
-                results[target]['times'].append(response_time)
-                results[target]['success'] += 1 if success else 0
-                results[target]['total'] += 1
-                
-                # Log progress for long-running tests
-                if (i + 1) % 10 == 0 or (i + 1) == num_requests:
-                    logger.debug(f"Completed {i+1}/{num_requests} requests to {target}")
+            # Log the request details
+            self._log_request(
+                operation=endpoint,
+                target=target,
+                response_time=response_time,
+                status_code=status_code,
+                cache_hit=cache_hit,
+                data_size=data_size
+            )
+            
+            return target, response_time, status_code, success, cache_hit, data_size
         
-        # Execute tests either concurrently or sequentially based on the run_concurrent flag
+        # Execute tests either concurrently or sequentially
         if run_concurrent:
-            logger.info(f"Running concurrent tests with up to 10 workers for {num_requests} requests...")
-            # Use a ThreadPoolExecutor with a reasonable number of workers
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, num_requests * 2)) as executor:
-                # Submit all test runs to the executor
-                future_to_target = {
-                    executor.submit(_test_single, target): target
-                    for target in ['direct', 'proxy']
-                    for _ in range(num_requests)
-                }
+            logger.info(f"Running concurrent tests with up to 10 workers...")
+            # Create list of all requests to make
+            all_requests = []
+            for target in ['direct', 'proxy']:
+                for _ in range(num_requests):
+                    all_requests.append(target)
+            
+            # Use ThreadPoolExecutor for concurrent execution
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(all_requests))) as executor:
+                # Submit all requests
+                futures = [executor.submit(_test_single_request, target) for target in all_requests]
                 
-                # Process completed futures as they complete
-                for future in concurrent.futures.as_completed(future_to_target):
-                    target = future_to_target[future]
+                # Process completed futures
+                for future in concurrent.futures.as_completed(futures):
                     try:
-                        future.result()  # This will raise any exceptions that occurred
+                        target, response_time, status_code, success, cache_hit, data_size = future.result()
+                        
+                        # Update results
+                        results[target]['times'].append(response_time)
+                        results[target]['success'] += 1 if success else 0
+                        results[target]['total'] += 1
+                        
                     except Exception as e:
-                        logger.error(f"Error in concurrent test to {target}: {str(e)}")
-                        # Log the full traceback for debugging
-                        logger.debug("Full traceback:", exc_info=True)
+                        logger.error(f"Error in concurrent request: {str(e)}")
                         # Continue with other tests even if one fails
         else:
             logger.info("Running sequential tests...")
-            try:
-                _test_single('direct')
-            except Exception as e:
-                logger.error(f"Error in direct test: {str(e)}")
-                logger.debug("Full traceback:", exc_info=True)
-                
-            try:
-                _test_single('proxy')
-            except Exception as e:
-                logger.error(f"Error in proxy test: {str(e)}")
-                logger.debug("Full traceback:", exc_info=True)
+            # Run tests sequentially
+            for target in ['direct', 'proxy']:
+                for i in range(num_requests):
+                    try:
+                        _, response_time, status_code, success, cache_hit, data_size = _test_single_request(target)
+                        
+                        # Update results
+                        results[target]['times'].append(response_time)
+                        results[target]['success'] += 1 if success else 0
+                        results[target]['total'] += 1
+                        
+                        # Log progress for long-running tests
+                        if (i + 1) % 10 == 0 or (i + 1) == num_requests:
+                            logger.debug(f"Completed {i+1}/{num_requests} requests to {target}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error in sequential request to {target}: {str(e)}")
+                        # Continue with next request
         
         # Calculate comprehensive statistics for the test run
         stats = {}
@@ -381,6 +386,7 @@ class PerformanceTester:
         This method processes the collected performance data to create:
         1. Raw data CSV file
         2. Basic summary statistics
+        3. Simple visualization plots
         """
         if not self.performance_data['operation']:
             logger.warning("No performance data available to generate report")
@@ -442,6 +448,7 @@ class PerformanceTester:
         except Exception as e:
             logger.error(f"Error generating report: {str(e)}")
             raise
+    
     def _generate_plots(self, df: pd.DataFrame) -> None:
         """Generate basic performance visualization plots."""
         try:
@@ -523,6 +530,127 @@ def parse_arguments():
             parser.error(f"URL must start with 'http://' or 'https://': {url}")
             
     return args
+
+def test_large_request(server_url: str, proxy_url: str, num_requests: int = 3, size_mb: int = 10) -> list:
+    """
+    Test the performance of large file downloads through both direct and proxy connections.
+    
+    This function is specifically designed to measure:
+    - Download speeds for large files
+    - Memory usage during large transfers
+    - Caching effectiveness for large responses
+    
+    Args:
+        server_url (str): Base URL of the backend server
+        proxy_url (str): Base URL of the proxy server
+        num_requests (int): Number of times to repeat the test (default: 3)
+        size_mb (int): Size of the test file in megabytes (default: 10MB)
+        
+    Returns:
+        list: A list of dictionaries containing test results
+        
+    The test will download the specified file multiple times and report statistics
+    for both direct and proxied connections.
+    """
+    print(f"\n{'='*60}")
+    print(f"LARGE FILE DOWNLOAD TEST ({size_mb}MB)".center(60))
+    print(f"{'='*60}")
+    
+    # Initialize the tester with a dedicated output directory
+    tester = PerformanceTester(
+        server_url=server_url,
+        proxy_url=proxy_url,
+        output_dir=f"large_request_{size_mb}MB_results"
+    )
+    
+    # Track overall statistics
+    all_stats = []
+    
+    try:
+        # Run the test multiple times to get consistent measurements
+        for i in range(num_requests):
+            print(f"\n--- Test Iteration {i+1}/{num_requests} ---")
+            print(f"Downloading {size_mb}MB file...")
+            
+            # Execute the test
+            stats = tester.test_endpoint(
+                endpoint=f"large?size={size_mb}",
+                method='GET',
+                num_requests=1,
+                run_concurrent=False  # Run sequentially for large downloads
+            )
+            
+            # Calculate download speed
+            for target, metrics in stats.items():
+                duration_s = metrics['avg_time'] / 1000  # Convert ms to seconds
+                size_mb_actual = metrics.get('data_size', 0) / (1024 * 1024)
+                mbps = (size_mb_actual * 8) / duration_s if duration_s > 0 else 0
+                
+                print(f"\n{target.upper()} Results:")
+                print(f"  Time: {metrics['avg_time']:,.2f} ms")
+                print(f"  Size: {size_mb_actual:,.2f} MB")
+                print(f"  Speed: {mbps:,.2f} Mbps")
+                
+                # Store for final summary
+                all_stats.append({
+                    'target': target,
+                    'iteration': i + 1,
+                    'time_ms': metrics['avg_time'],
+                    'size_mb': size_mb_actual,
+                    'speed_mbps': mbps
+                })
+    
+    except Exception as e:
+        print(f"\nError during large request test: {str(e)}")
+        logging.error("Large request test failed", exc_info=True)
+    
+    finally:
+        # Always generate a report, even if the test was interrupted
+        print("\nGenerating final report...")
+        tester.generate_report()
+        
+        # Print final summary
+        if all_stats:
+            print("\n" + "="*60)
+            print("LARGE FILE DOWNLOAD SUMMARY".center(60))
+            print("="*60)
+            
+            # Group by target (direct/proxy)
+            df = pd.DataFrame(all_stats)
+            
+            for target in ['direct', 'proxy']:
+                target_stats = df[df['target'] == target]
+                if len(target_stats) > 0:
+                    print(f"\n{target.upper()} AVERAGES (n={len(target_stats)}):")
+                    print(f"  Time: {target_stats['time_ms'].mean():,.2f} ms")
+                    print(f"  Size: {target_stats['size_mb'].mean():,.2f} MB")
+                    print(f"  Speed: {target_stats['speed_mbps'].mean():,.2f} Mbps")
+                    print(f"  Min Speed: {target_stats['speed_mbps'].min():,.2f} Mbps")
+                    print(f"  Max Speed: {target_stats['speed_mbps'].max():,.2f} Mbps")
+            # Print divider between target types
+            print("\n" + "-" * 60)
+    
+    return all_stats
+
+def create_test_users(num_users: int = 5) -> List[Dict[str, Any]]:
+    """
+    Create a list of test user data for POST request testing.
+    
+    Args:
+        num_users (int): Number of test users to create
+        
+    Returns:
+        List[Dict[str, Any]]: List of user dictionaries with test data
+    """
+    users = []
+    for i in range(num_users):
+        users.append({
+            'id': f'test_user_{i}_{int(time.time())}',
+            'name': f'Test User {i+1}',
+            'email': f'test_user_{i}_{int(time.time())}@example.com',
+            'created_at': datetime.now().isoformat()
+        })
+    return users
 
 def main():
     """
@@ -625,141 +753,6 @@ def main():
         print(f"\n\nError during testing: {str(e)}")
         logging.error("Unhandled exception", exc_info=True)
         sys.exit(1)
-    
-    # Report already generated in the try block
 
-if __name__ == "__main__":
-    main()
-
-def test_large_request(server_url: str, proxy_url: str, num_requests: int = 3, size_mb: int = 10) -> list:
-    """
-    Test the performance of large file downloads through both direct and proxy connections.
-    
-    This function is specifically designed to measure:
-    - Download speeds for large files
-    - Memory usage during large transfers
-    - Caching effectiveness for large responses
-    
-    Args:
-        server_url (str): Base URL of the backend server
-        proxy_url (str): Base URL of the proxy server
-        num_requests (int): Number of times to repeat the test (default: 3)
-        size_mb (int): Size of the test file in megabytes (default: 10MB)
-        
-    Returns:
-        list: A list of dictionaries containing test results
-        
-    The test will download the specified file multiple times and report statistics
-    for both direct and proxied connections.
-    """
-    print(f"\n{'='*60}")
-    print(f"LARGE FILE DOWNLOAD TEST ({size_mb}MB)".center(60))
-    print(f"{'='*60}")
-    
-    # Initialize the tester with a dedicated output directory
-    tester = PerformanceTester(
-        server_url=server_url,
-        proxy_url=proxy_url,
-        output_dir=f"large_request_{size_mb}MB_results"
-    )
-    
-    # Track overall statistics
-    all_stats = []
-    
-    try:
-        # Run the test multiple times to get consistent measurements
-        for i in range(num_requests):
-            print(f"\n--- Test Iteration {i+1}/{num_requests} ---")
-            print(f"Downloading {size_mb}MB file...")
-            
-            # Time the download
-            start_time = time.time()
-            
-            # Execute the test
-            stats = tester.test_endpoint(
-                endpoint=f"large?size={size_mb}",
-                method='GET',
-                num_requests=1,
-                concurrent=False  # Run sequentially for large downloads
-            )
-            
-            # Calculate download speed
-            for target, metrics in stats.items():
-                duration_s = metrics['avg_time'] / 1000  # Convert ms to seconds
-                size_mb_actual = metrics.get('data_size', 0) / (1024 * 1024)
-                mbps = (size_mb_actual * 8) / duration_s if duration_s > 0 else 0
-                
-                print(f"\n{target.upper()} Results:")
-                print(f"  Time: {metrics['avg_time']:,.2f} ms")
-                print(f"  Size: {size_mb_actual:,.2f} MB")
-                print(f"  Speed: {mbps:,.2f} Mbps")
-                
-                # Store for final summary
-                all_stats.append({
-                    'target': target,
-                    'iteration': i + 1,
-                    'time_ms': metrics['avg_time'],
-                    'size_mb': size_mb_actual,
-                    'speed_mbps': mbps
-                })
-    
-    except Exception as e:
-        print(f"\nError during large request test: {str(e)}")
-        logging.error("Large request test failed", exc_info=True)
-    
-    finally:
-        # Always generate a report, even if the test was interrupted
-        print("\nGenerating final report...")
-        tester.generate_report()
-        
-        # Print final summary
-        if all_stats:
-            print("\n" + "="*60)
-            print("LARGE FILE DOWNLOAD SUMMARY".center(60))
-            print("="*60)
-            
-            # Group by target (direct/proxy)
-            import pandas as pd
-            df = pd.DataFrame(all_stats)
-            
-            for target in ['direct', 'proxy']:
-                target_stats = df[df['target'] == target]
-                if len(target_stats) > 0:
-                    print(f"\n{target.upper()} AVERAGES (n={len(target_stats)}):")
-                    print(f"  Time: {target_stats['time_ms'].mean():,.2f} ms")
-                    print(f"  Size: {target_stats['size_mb'].mean():,.2f} MB")
-                    print(f"  Speed: {target_stats['speed_mbps'].mean():,.2f} Mbps")
-                    print(f"  Min Speed: {target_stats['speed_mbps'].min():,.2f} Mbps")
-                    print(f"  Max Speed: {target_stats['speed_mbps'].max():,.2f} Mbps")
-            # Print divider between target types
-            print("\n" + "-" * 60)
-    
-    return all_stats
-
-def create_test_users(num_users=5):
-    )
-        
-# Generate comprehensive report
-print("\n" + "="*60)
-print("GENERATING FINAL REPORT".center(60))
-print("="*60)
-tester.generate_report()
-        
-print("\n" + "="*60)
-print("TESTING COMPLETED SUCCESSFULLY".center(60))
-print("="*60)
-print(f"Results saved to: {Path(args.output).resolve()}")
-        
-except KeyboardInterrupt:
-    print("\n\nTest interrupted by user. Partial results will be saved.")
-    if 'tester' in locals():
-        tester.generate_report()  # Save partial results
-    sys.exit(1)
-        
-except Exception as e:
-    print(f"\n\nError during testing: {str(e)}")
-    logging.error("Unhandled exception", exc_info=True)
-    sys.exit(1)
-    
 if __name__ == "__main__":
     main()
