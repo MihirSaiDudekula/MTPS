@@ -223,7 +223,7 @@ class PerformanceTester:
     
     def test_endpoint(self, endpoint: str, method: str = 'GET',
                      data: Optional[dict] = None, num_requests: int = 10,
-                     concurrent: bool = True) -> Dict[str, Any]:
+                     run_concurrent: bool = True) -> Dict[str, Any]:
         """
         Test a specific API endpoint through both direct and proxy connections.
         
@@ -247,8 +247,7 @@ class PerformanceTester:
                   - success_rate: Percentage of successful requests
                   - throughput: Requests per second
         """
-        logger.info(f"Testing endpoint: {endpoint} ({method}) - {num_requests} requests per target"
-                  f" (concurrent: {concurrent})")
+        logger.info(f"Testing endpoint: {endpoint} ({method}) - {num_requests} requests per target (concurrent: {run_concurrent})")
         
         # Initialize results storage
         results = {
@@ -296,8 +295,8 @@ class PerformanceTester:
                 if (i + 1) % 10 == 0 or (i + 1) == num_requests:
                     logger.debug(f"Completed {i+1}/{num_requests} requests to {target}")
         
-        # Execute tests either concurrently or sequentially based on the concurrent flag
-        if concurrent:
+        # Execute tests either concurrently or sequentially based on the run_concurrent flag
+        if run_concurrent:
             logger.info(f"Running concurrent tests with up to 10 workers for {num_requests} requests...")
             # Use a ThreadPoolExecutor with a reasonable number of workers
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, num_requests * 2)) as executor:
@@ -695,7 +694,7 @@ def main():
                 method=test['method'],
                 data=test['data'],
                 num_requests=test['requests'],
-                concurrent=test.get('concurrent', args.concurrent)
+                run_concurrent=test.get('concurrent', args.concurrent)
             )
         
         # Generate comprehensive report
