@@ -391,17 +391,20 @@ class PerformanceTester:
             logger.info(f"Saved raw performance data to: {raw_data_path}")
             
             # 2. Generate and save summary statistics
-            summary = df.groupby(['operation', 'target'])['response_time'].agg(
-                mean=('response_time', 'mean'),
-                min=('response_time', 'min'),
-                max=('response_time', 'max'),
-                p50=('response_time', lambda x: np.percentile(x, 50)),
-                p90=('response_time', lambda x: np.percentile(x, 90)),
-                p95=('response_time', lambda x: np.percentile(x, 95)),
-                std=('response_time', 'std'),
-                count=('response_time', 'count'),
-                success_rate=('status_code', lambda x: (x < 400).mean() * 100)
-            ).reset_index()
+            summary = (
+                df.groupby(['operation', 'target']).agg(
+                    mean_response_time=('response_time', 'mean'),
+                    min_response_time=('response_time', 'min'),
+                    max_response_time=('response_time', 'max'),
+                    p50_response_time=('response_time', lambda x: np.percentile(x, 50)),
+                    p90_response_time=('response_time', lambda x: np.percentile(x, 90)),
+                    p95_response_time=('response_time', lambda x: np.percentile(x, 95)),
+                    std_response_time=('response_time', 'std'),
+                    count_requests=('response_time', 'count'),
+                    success_rate=('status_code', lambda x: (x < 400).mean() * 100)
+                )
+                .reset_index()
+            )
             
             # Format the summary for better readability
             summary = summary.round({
