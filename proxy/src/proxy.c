@@ -109,6 +109,21 @@ void safe_log(const char* format, ...) {
 #define MAX_BYTES 65536
 #define MAX_ELEMENT_SIZE 10 * (1<<20)
 #define MAX_CACHE_SIZE 200 * (1<<20)
+
+// Backend server configuration
+#define NUM_BACKENDS 2
+typedef struct {
+    const char *host;
+    int port;
+} backend_server;
+
+static backend_server backends[NUM_BACKENDS] = {
+    {"server1", 3000},  // First backend server
+    {"server2", 3000}   // Second backend server
+};
+
+static int current_backend = 0;
+static pthread_mutex_t backend_lock = PTHREAD_MUTEX_INITIALIZER;
 #define DEFAULT_PORT 8080
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define TARGET_HOST "localhost"
@@ -218,6 +233,15 @@ void parse_http_request(char* buffer, struct http_request* req) {
     *line_end = '\r'; // Restore the CRLF
     
     safe_log("Parsed request: %s %s %s", req->method, req->url, req->version);
+}
+
+// Get the next backend server in round-robin fashion
+void get_next_backend(const char** host, int* port) {
+    pthread_mutex_lock(&backend_lock);
+    *host = backends[current_backend].host;
+    *port = backends[current_backend].port;
+    current_backend = (current_backend + 1) % NUM_BACKENDS;
+    pthread_mutex_unlock(&backend_lock);
 }
 
 int connect_to_server(const char* host, int port, int timeout_ms) {
@@ -445,11 +469,29 @@ void* handle_client(void* arg) {
         cache_invalidate(req.url);
     }
     
-    // Connect to target server
-    int server_socket = connect_to_server(config.target_host, config.target_port, 5000);
+    // Connect to the next available backend server
+    const char *backend_host;
+    int backend_port;
+    int server_socket = -1;
+    int attempts = 0;
+    
+    // Try all backends in round-robin fashion until one succeeds or all fail
+    while (attempts < NUM_BACKENDS) {
+        get_next_backend(&backend_host, &backend_port);
+        safe_log("Attempting to connect to backend: %s:%d", backend_host, backend_port);
+        
+        server_socket = connect_to_server(backend_host, backend_port, 5000);
+        if (server_socket >= 0) {
+            break;  // Connection successful
+        }
+        
+        attempts++;
+        safe_log("Connection to %s:%d failed, trying next server...", backend_host, backend_port);
+    }
+    
     if (server_socket < 0) {
-        LOG_ERROR("Failed to connect to target server");
-        send_error_response(client_socket, 502, "Bad Gateway");
+        LOG_ERROR("All backend servers are unavailable");
+        send_error_response(client_socket, 503, "Service Unavailable");
         close(client_socket);
         sem_post(&connection_semaphore);
         return NULL;

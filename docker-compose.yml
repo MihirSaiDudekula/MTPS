@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Backend Server 1
+  server1:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+    ports:
+      - "3001:3000"
+    networks:
+      - app-network
+
+  # Backend Server 2
+  server2:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+    ports:
+      - "3002:3000"
+    networks:
+      - app-network
+
+  # Load Balancing Proxy Server
+  proxy:
+    build: 
+      context: ./proxy
+      dockerfile: Dockerfile
+    ports:
+      - "80:8080"
+    depends_on:
+      - server1
+      - server2
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
