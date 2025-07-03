@@ -376,14 +376,11 @@ class PerformanceTester:
     
     def generate_report(self) -> None:
         """
-        Generate comprehensive performance reports and visualizations.
+        Generate a simplified performance report with key metrics.
         
         This method processes the collected performance data to create:
-        1. Raw data CSV files
-        2. Summary statistics
-        3. Visualizations (time series, box plots, etc.)
-        
-        The generated files are saved to the output directory specified during initialization.
+        1. Raw data CSV file
+        2. Basic summary statistics
         """
         if not self.performance_data['operation']:
             logger.warning("No performance data available to generate report")
@@ -392,184 +389,81 @@ class PerformanceTester:
         logger.info("Generating performance report...")
         
         try:
-            # Convert performance data to a pandas DataFrame for easier analysis
+            # Create output directory if it doesn't exist
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create a DataFrame from the performance data
             df = pd.DataFrame(self.performance_data)
             
-            # Ensure output directory exists
-            self.output_dir.mkdir(exist_ok=True)
-            
-            # 1. Save raw performance data
+            # 1. Save raw data to CSV
             raw_data_path = self.output_dir / 'performance_data.csv'
             df.to_csv(raw_data_path, index=False)
             logger.info(f"Saved raw performance data to: {raw_data_path}")
             
-            # 2. Generate and save summary statistics
-            summary = (
-                df.groupby(['operation', 'target']).agg(
-                    mean_response_time=('response_time', 'mean'),
-                    min_response_time=('response_time', 'min'),
-                    max_response_time=('response_time', 'max'),
-                    p50_response_time=('response_time', lambda x: np.percentile(x, 50)),
-                    p90_response_time=('response_time', lambda x: np.percentile(x, 90)),
-                    p95_response_time=('response_time', lambda x: np.percentile(x, 95)),
-                    std_response_time=('response_time', 'std'),
-                    count_requests=('response_time', 'count'),
-                    success_rate=('status_code', lambda x: (x < 400).mean() * 100)
-                )
-                .reset_index()
-            )
+            # 2. Calculate basic statistics
+            stats = []
+            for (operation, target), group in df.groupby(['operation', 'target']):
+                times = group['response_time']
+                success_rate = (group['status_code'] < 400).mean() * 100
+                
+                stats.append({
+                    'Operation': operation,
+                    'Target': target,
+                    'Requests': len(times),
+                    'Avg Time (ms)': f"{times.mean():.2f}",
+                    'Min (ms)': f"{times.min():.2f}",
+                    'Max (ms)': f"{times.max():.2f}",
+                    'Success %': f"{success_rate:.1f}"
+                })
             
-            # Format the summary for better readability
-            summary = summary.round({
-                'mean': 2, 'min': 2, 'max': 2, 'p50': 2, 'p90': 2, 'p95': 2, 'std': 2, 'success_rate': 2
-            })
+            # Convert to DataFrame for nice formatting
+            summary = pd.DataFrame(stats)
             
+            # Print summary to console
+            print("\n" + "="*70)
+            print("PERFORMANCE TEST SUMMARY".center(70))
+            print("="*70)
+            print(summary.to_string(index=False))
+            print("\nDetailed results saved to:", self.output_dir.absolute())
+            
+            # Save summary to CSV
             summary_path = self.output_dir / 'summary_statistics.csv'
             summary.to_csv(summary_path, index=False)
             logger.info(f"Saved summary statistics to: {summary_path}")
             
-            # 3. Generate visualizations if we have enough data
-            self._generate_visualizations(df, summary)
+            # Generate basic plots if possible
+            try:
+                self._generate_plots(df)
+            except Exception as e:
+                logger.warning(f"Could not generate plots: {str(e)}")
             
             logger.info("Report generation completed successfully")
             
         except Exception as e:
             logger.error(f"Error generating report: {str(e)}")
             raise
-        
-        # Generate visualizations
-        self._generate_plots(df)
-        
-        # Print summary
-        print("\n" + "="*50)
-        print("PERFORMANCE TEST SUMMARY")
-        print("="*50)
-        print(summary.to_string())
-        print("\nDetailed results saved to:", self.output_dir.absolute())
-    
     def _generate_plots(self, df: pd.DataFrame) -> None:
-        """Generate performance visualization plots."""
-        plt.figure(figsize=(15, 10))
-        
-        # Response time comparison
-        plt.subplot(2, 2, 1)
-        sns.boxplot(x='operation', y='response_time', hue='target', data=df)
-        plt.title('Response Time Comparison')
-        plt.yscale('log')
-        plt.xticks(rotation=45)
-        
-        # Success rate
-        plt.subplot(2, 2, 2)
-        success_rates = df.groupby(['operation', 'target'])['status_code'].apply(
-            lambda x: (x < 400).mean() * 100
-        ).unstack()
-        success_rates.plot(kind='bar', ax=plt.gca())
-        plt.title('Success Rate by Endpoint')
-        plt.ylabel('Success Rate (%)')
-        plt.xticks(rotation=45)
-        
-        # Throughput
-        plt.subplot(2, 2, 3)
-        throughput = df.groupby(['operation', 'target']).size().unstack()
-        throughput.plot(kind='bar', ax=plt.gca())
-        plt.title('Total Requests by Endpoint')
-        plt.ylabel('Number of Requests')
-        plt.xticks(rotation=45)
-        
-        # Data size distribution
-        plt.subplot(2, 2, 4)
-        sns.violinplot(x='operation', y='data_size', hue='target', data=df)
-        plt.title('Response Size Distribution')
-        plt.yscale('log')
-        plt.ylabel('Response Size (bytes)')
-        plt.xticks(rotation=45)
-        
-        stats[target] = {
-            'avg_time': statistics.mean(times),  # Average response time in ms
-            'min_time': min(times),             # Fastest response time in ms
-            'max_time': max(times),             # Slowest response time in ms
-            'p90': np.percentile(times, 90),    # 90th percentile response time in ms
-            'success_rate': success_rate,        # Percentage of successful requests
-            'throughput': len(times) / total_time if total_time > 0 else 0,  # req/s
-            'total_requests': len(times),        # Total number of requests made
-            'failed_requests': len(times) - results[target]['success']  # Failed requests
-        }
-        
-        # Log summary for this target
-        logger.info(
-            f"{target.upper()} Results - "
-            f"Avg: {stats[target]['avg_time']:.2f}ms, "
-            f"Min: {stats[target]['min_time']:.2f}ms, "
-            f"Max: {stats[target]['max_time']:.2f}ms, "
-            f"Success: {stats[target]['success_rate']:.1f}%"
-        )
-
-def generate_report(self) -> None:
-    """
-    Generate comprehensive performance reports and visualizations.
-    
-    This method processes the collected performance data to create:
-    1. Raw data CSV files
-    2. Summary statistics
-    3. Visualizations (time series, box plots, etc.)
-    
-    The generated files are saved to the output directory specified during initialization.
-    """
-    if not self.performance_data['operation']:
-        logger.warning("No performance data available to generate report")
-        return
-    
-    logger.info("Generating performance report...")
-    
-    try:
-        # Convert performance data to a pandas DataFrame for easier analysis
-        df = pd.DataFrame(self.performance_data)
-        
-        # Ensure output directory exists
-        self.output_dir.mkdir(exist_ok=True)
-        
-        # 1. Save raw performance data
-        raw_data_path = self.output_dir / 'performance_data.csv'
-        df.to_csv(raw_data_path, index=False)
-        logger.info(f"Saved raw performance data to: {raw_data_path}")
-        
-        # 2. Generate and save summary statistics
-        summary = df.groupby(['operation', 'target'])['response_time'].agg(
-            mean=('response_time', 'mean'),
-            min=('response_time', 'min'),
-            max=('response_time', 'max'),
-            p50=('response_time', lambda x: np.percentile(x, 50)),
-            p90=('response_time', lambda x: np.percentile(x, 90)),
-            p95=('response_time', lambda x: np.percentile(x, 95)),
-            std=('response_time', 'std'),
-            count=('response_time', 'count'),
-            success_rate=('status_code', lambda x: (x < 400).mean() * 100)
-        ).reset_index()
-        
-        # Format the summary for better readability
-        summary = summary.round({
-            'mean': 2, 'min': 2, 'max': 2, 'p50': 2, 'p90': 2, 'p95': 2, 'std': 2, 'success_rate': 2
-        })
-        
-        summary_path = self.output_dir / 'summary_statistics.csv'
-        summary.to_csv(summary_path, index=False)
-        logger.info(f"Saved summary statistics to: {summary_path}")
-        
-        # Generate visualizations
-        self._generate_plots(df)
-        
-        # Print summary to console
-        print("\n" + "="*50)
-        print("PERFORMANCE TEST SUMMARY")
-        print("="*50)
-        print(summary.to_string())
-        print("\nDetailed results saved to:", self.output_dir.absolute())
-        
-        logger.info("Report generation completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error generating report: {str(e)}")
-        raise
+        """Generate basic performance visualization plots."""
+        try:
+            plt.figure(figsize=(12, 6))
+            
+            # Simple response time comparison
+            plt.subplot(1, 2, 1)
+            sns.barplot(x='operation', y='response_time', hue='target', data=df, ci='sd')
+            plt.title('Average Response Time (ms)')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            # Save the figure
+            plot_path = self.output_dir / 'performance_summary.png'
+            plt.savefig(plot_path, dpi=120, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Saved performance summary plot to: {plot_path}")
+            
+        except Exception as e:
+            logger.warning(f"Could not generate plots: {str(e)}")
+            # Don't fail the whole report if plotting fails
 
 def parse_arguments():
     """
@@ -732,8 +626,7 @@ def main():
         logging.error("Unhandled exception", exc_info=True)
         sys.exit(1)
     
-    # Generate final report
-    tester.generate_report()
+    # Report already generated in the try block
 
 if __name__ == "__main__":
     main()
@@ -844,187 +737,29 @@ def test_large_request(server_url: str, proxy_url: str, num_requests: int = 3, s
     return all_stats
 
 def create_test_users(num_users=5):
-    print(f"\nCreating {num_users} test users...")
-    created_users = []
-    
-    for i in range(num_users):
-        user_data = {
-            "id": str(i + 1),
-            "name": f"Test User {i + 1}",
-            "email": f"user{i + 1}@example.com"
-        }
-        headers = {'Content-Type': 'application/json'}
-        
-        start_time = time.time()
-        response = requests.post(
-            f"{SERVER_URL}/users",
-            json=user_data,
-            headers=headers
-        )
-        elapsed_time = time.time() - start_time
-        log_request('create_user', elapsed_time, response.status_code)
-        
-        if response.status_code == 201:
-            created_users.append(response.json())
-            print(f"Created user {i + 1}")
-    
-    return created_users
-
-def get_users():
-    print("\nRetrieving users through proxy...")
-    headers = {'Host': 'localhost:3000'}
-    
-    start_time = time.time()
-    response = requests.get(f"{PROXY_URL}/users", headers=headers)
-    elapsed_time = time.time() - start_time
-    
-    log_request('get_users', elapsed_time, response.status_code)
-    
-    if response.status_code == 200:
-        users = response.json()
-        print(f"Retrieved {len(users)} users")
-        return users
-    else:
-        print(f"Failed to retrieve users. Status code: {response.status_code}")
-        return []
-
-#def delete_users(user_ids):
-#    print(f"\nDeleting {len(user_ids)} users...")
-#    for user_id in user_ids:
-#        start_time = time.time()
-#        response = requests.delete(f"{SERVER_URL}/users/{user_id}")
-#        elapsed_time = time.time() - start_time
-#        log_request('delete_user', elapsed_time, response.status_code)
-#        print(f"Deleted user {user_id}")
-
-def generate_performance_graphs():
-    """Generate comprehensive performance visualization"""
-    df = pd.DataFrame(performance_data)
-    
-    # Use a clean, built-in style
-    plt.style.use('bmh')
-    
-    # Create multiple subplots
-    fig, axes = plt.subplots(3, 2, figsize=(18, 15))
-    fig.suptitle('Proxy Server Performance Analysis', fontsize=16)
-    
-    # 1. Cache Performance Comparison
-    cache_data = df[df['operation'].str.contains('large_request')]
-    
-    # Calculate statistics
-    stats = cache_data.groupby('operation')['response_time'].agg(['mean', 'std']).reset_index()
-    
-    # Bar plot for cache performance
-    ax = axes[0, 0]
-    bars = ax.bar(
-        ['First Request', 'Cached Requests'],
-        stats['mean'],
-        yerr=stats['std'],
-        color=['lightcoral', 'lightgreen'],
-        capsize=5
     )
+        
+# Generate comprehensive report
+print("\n" + "="*60)
+print("GENERATING FINAL REPORT".center(60))
+print("="*60)
+tester.generate_report()
+        
+print("\n" + "="*60)
+print("TESTING COMPLETED SUCCESSFULLY".center(60))
+print("="*60)
+print(f"Results saved to: {Path(args.output).resolve()}")
+        
+except KeyboardInterrupt:
+    print("\n\nTest interrupted by user. Partial results will be saved.")
+    if 'tester' in locals():
+        tester.generate_report()  # Save partial results
+    sys.exit(1)
+        
+except Exception as e:
+    print(f"\n\nError during testing: {str(e)}")
+    logging.error("Unhandled exception", exc_info=True)
+    sys.exit(1)
     
-    ax.set_title('Cache Performance Impact')
-    ax.set_ylabel('Response Time (seconds)')
-    
-    # Add value labels
-    for bar in bars:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.2f}s',
-                ha='center', va='bottom')
-    
-    # Calculate improvement
-    nocache_time = stats[stats['operation'] == 'large_request_nocache']['mean'].iloc[0]
-    cache_time = stats[stats['operation'] == 'large_request_cached']['mean'].iloc[0]
-    improvement = ((nocache_time - cache_time) / nocache_time) * 100
-    
-    ax.text(0.5, -0.15, 
-             f'Cache Performance Improvement: {improvement:.1f}%',
-             ha='center',
-             transform=ax.transAxes,
-             fontsize=12,
-             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=5))
-
-    # 2. Response Time Distribution
-    ax = axes[0, 1]
-    sns.boxplot(data=df, x='operation', y='response_time', ax=ax)
-    ax.set_title('Response Time Distribution')
-    ax.set_ylabel('Response Time (seconds)')
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-
-    # 3. Cache Hit Rate
-    ax = axes[1, 0]
-    cache_stats = df.groupby('cache_hit').size()
-    cache_stats.plot(kind='pie', autopct='%.1f%%', ax=ax)
-    ax.set_title('Cache Hit Rate')
-    ax.set_ylabel('')
-
-    # 4. Status Code Distribution
-    ax = axes[1, 1]
-    status_stats = df['status_code'].value_counts()
-    status_stats.plot(kind='bar', ax=ax)
-    ax.set_title('Status Code Distribution')
-    ax.set_ylabel('Count')
-
-    # 5. Request Timeline
-    ax = axes[2, 0]
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.set_index('timestamp', inplace=True)
-    df['response_time'].plot(ax=ax)
-    ax.set_title('Request Response Times Over Time')
-    ax.set_ylabel('Response Time (seconds)')
-
-    # 6. Error Rate
-    ax = axes[2, 1]
-    error_rate = df[df['status_code'] >= 400].groupby('operation').size() / df.groupby('operation').size() * 100
-    error_rate.plot(kind='bar', ax=ax)
-    ax.set_title('Error Rate by Operation')
-    ax.set_ylabel('Error Rate (%)')
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig('performance_analysis.png')
-    print("\nPerformance analysis saved to 'performance_analysis.png'")
-    for op in regular_ops['operation'].unique():
-        grouped_data.append(regular_ops[regular_ops['operation'] == op]['response_time'].values)
-        labels.append(op.replace('_', ' ').title())
-    
-    # Create box plot
-    plt.boxplot(grouped_data, labels=labels)
-    plt.title('Response Times by Operation Type (Excluding Large Requests)', fontsize=14, pad=20)
-    plt.xticks(rotation=45, ha='right')
-    plt.ylabel('Response Time (seconds)', fontsize=12)
-    
-    # Adjust layout
-    plt.tight_layout(pad=3.0)
-    plt.savefig('performance_analysis.png', bbox_inches='tight', dpi=300)
-    print("\nPerformance graphs saved as 'performance_analysis.png'")
-
-def print_performance_summary():
-    """Print improved performance summary with detailed statistics"""
-    df = pd.DataFrame(performance_data)
-    print("\nPerformance Summary:")
-    print("-" * 50)
-    
-    # Calculate cache performance with more detail
-    cache_data = df[df['operation'].str.contains('large_request')]
-    nocache_stats = cache_data[cache_data['operation'] == 'large_request_nocache']['response_time']
-    cache_stats = cache_data[cache_data['operation'] == 'large_request_cached']['response_time']
-    
-    print(f"\nLarge Request (10MB) Performance Analysis:")
-    print(f"First request (no cache): {nocache_stats.mean():.4f} seconds")
-    print(f"Cached requests:")
-    print(f"  - Average: {cache_stats.mean():.4f} seconds")
-    print(f"  - Min: {cache_stats.min():.4f} seconds")
-    print(f"  - Max: {cache_stats.max():.4f} seconds")
-    print(f"  - Standard deviation: {cache_stats.std():.4f} seconds")
-    print(f"Cache speedup: {((nocache_stats.mean() - cache_stats.mean()) / nocache_stats.mean() * 100):.1f}%")
-    
-    print("\nOther Operations (mean response times):")
-    regular_ops = df[~df['operation'].str.contains('large_request')]
-    summary = regular_ops.groupby('operation')['response_time'].agg(['count', 'mean', 'min', 'max', 'std'])
-    summary.columns = ['Count', 'Mean', 'Min', 'Max', 'Std Dev']
-    print(summary.round(4))
-
 if __name__ == "__main__":
     main()
