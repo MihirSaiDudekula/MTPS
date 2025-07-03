@@ -1,758 +1,93 @@
-#!/usr/bin/env python3
-'''
-Enhanced Test Suite for Multithreaded Proxy Server
-
-This script performs comprehensive testing of the proxy server and backend server,
-measuring performance metrics and validating functionality with improved error handling
-and visualization. It supports both direct and proxied requests to compare performance.
-
-Key Features:
-- Concurrent request testing
-- Performance metrics collection
-- Visualization of results
-- Error handling and logging
-- Support for various HTTP methods
-'''
-
-# Standard library imports
-import sys
+import subprocess
 import time
 import json
-import socket
-import logging
-import statistics
-import argparse
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
-import concurrent.futures
 
-# Third-party imports
-import requests  # For making HTTP requests
-import pandas as pd  # For data manipulation and analysis
-import numpy as np  # For numerical operations
-import matplotlib.pyplot as plt  # For creating static visualizations
-import seaborn as sns  # For statistical data visualization
+# Config
+backend_base = "http://localhost:3000"
+proxy_base = "http://localhost:8080"
 
-# Configure logging to both file and console
-# This helps in debugging and monitoring the test execution
+endpoints = [
+    {"path": "/health", "method": "GET"},
+    {"path": "/", "method": "GET"},
+    {"path": "/test", "method": "GET"},
+    {"path": "/users", "method": "GET"},
+    {"path": "/large", "method": "GET"}
+]
 
-def setup_logging():
-    """
-    Configure logging for the application.
-    
-    Sets up logging to both console and file with a specific format.
-    Logs are written to 'performance_test.log' in the current directory.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('performance_test.log'),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
+# Test Data for POST
+user_data = {
+    "id": "123",
+    "name": "Test User",
+    "email": "test@example.com"
+}
 
-# Initialize logger
-logger = setup_logging()
+def run_curl(url, method="GET", data=None):
+    """Run curl command and measure elapsed time."""
+    cmd = ["curl", "-o", "/dev/null", "-s", "-w", "%{time_total}"]
 
-class PerformanceTester:
-    """
-    A class to test and compare performance of direct vs proxied HTTP requests.
-    
-    This class provides methods to:
-    - Make HTTP requests to both direct and proxy endpoints
-    - Collect performance metrics
-    - Generate reports and visualizations
-    - Handle concurrent requests
-    """
-    
-    def __init__(self, server_url: str, proxy_url: str, output_dir: str = "results"):
-        """
-        Initialize the PerformanceTester with server and proxy URLs.
-        
-        Args:
-            server_url (str): Base URL of the backend server (e.g., 'http://localhost:3000')
-            proxy_url (str): Base URL of the proxy server (e.g., 'http://localhost:8080')
-            output_dir (str): Directory to save test results and graphs (default: 'results')
-        """
-        # Remove trailing slashes from URLs for consistency
-        self.server_url = server_url.rstrip('/')
-        self.proxy_url = proxy_url.rstrip('/')
-        
-        # Set up output directory
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        # Initialize data structure to store performance metrics
-        # This will be used to generate reports and visualizations
-        self.performance_data = {
-            'operation': [],     # The API endpoint being tested
-            'target': [],        # 'direct' or 'proxy' - indicates request path
-            'response_time': [], # Response time in milliseconds
-            'status_code': [],   # HTTP status code of the response
-            'timestamp': [],     # When the request was made
-            'cache_hit': [],     # Whether the response came from cache
-            'data_size': []      # Size of response data in bytes
-        }
-        
-    def _make_request(self, url: str, method: str = 'GET', 
-                     data: Optional[dict] = None, 
-                     headers: Optional[dict] = None,
-                     target: str = 'direct') -> Tuple[float, int, bool, bool, int]:
-        """
-        Execute an HTTP request and capture performance metrics.
-        
-        This internal method handles the actual HTTP request execution, timing, and error handling.
-        It supports GET, POST, and DELETE methods and captures various performance metrics.
-        
-        Args:
-            url (str): The complete URL to send the request to
-            method (str): HTTP method to use (GET, POST, DELETE)
-            data (dict, optional): JSON data to send with POST requests
-            headers (dict, optional): Custom HTTP headers to include in the request
-            target (str): 'direct' or 'proxy' - used for logging and metrics
-            
-        Returns:
-            Tuple containing:
-                - response_time_ms (float): Time taken for the request in milliseconds
-                - status_code (int): HTTP status code (0 if request failed)
-                - success (bool): Whether the request was successful
-                - cache_hit (bool): Whether the response came from cache
-                - data_size (int): Size of the response data in bytes
-                
-        Note:
-            - Times out after 30 seconds if no response is received
-            - Logs errors but doesn't raise exceptions to allow test continuation
-        """
-        start_time = time.time()
-        cache_hit = False
-        data_size = 0
-        
-        try:
-            # Set default headers if none provided
-            if headers is None:
-                headers = {'User-Agent': 'PerformanceTester/1.0'}
-            else:
-                # Create a shallow copy so we don't mutate the caller's dictionary
-                headers = dict(headers)
+    if method == "POST":
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(data or {})]
 
-            # Ensure backend Host header is present when making a request through the proxy.
-            # Some reverse proxies rely on the Host header when forwarding the request.
-            if target == 'proxy':
-                backend_host = self.server_url.split('://', 1)[-1]
-                headers.setdefault('Host', backend_host)
+    cmd.append(url)
 
-            # Add Content-Type for payload-carrying methods if not already specified
-            if method.upper() in ['POST', 'PUT', 'PATCH'] and 'Content-Type' not in headers:
-                headers['Content-Type'] = 'application/json'
-            
-            # Execute the appropriate HTTP method
-            method = method.upper()
-            request_kwargs = {
-                'url': url,
-                'headers': headers,
-                'timeout': 30,  # Increased timeout for large file transfers
-                'allow_redirects': True
-            }
-            
-            # Add data/params based on method
-            if method in ['POST', 'PUT', 'PATCH']:
-                request_kwargs['json'] = data
-            elif method == 'GET' and data:
-                request_kwargs['params'] = data
-            
-            # Make the request
-            response = requests.request(method, **request_kwargs)
-                
-            # Calculate response time in milliseconds
-            response_time = (time.time() - start_time) * 1000
-            
-            # Get response metadata
-            data_size = len(response.content)
-            # Detect cache hits from proxy response headers. The proxy uses the standard
-            # "X-Cache: HIT/MISS" header but we also check the commonly used
-            # "X-Proxy-Cache" header just in case.
-            cache_header = response.headers.get('X-Cache') or response.headers.get('X-Proxy-Cache') or ''
-            cache_hit = str(cache_header).lower().startswith('hit')
-            
-            return (
-                response_time,          # Time taken in milliseconds
-                response.status_code,   # HTTP status code
-                response.ok,            # True for 2xx status codes
-                cache_hit,              # Whether response came from cache
-                data_size               # Response body size in bytes
-            )
-            
-        except requests.exceptions.RequestException as e:
-            # Handle request errors gracefully
-            response_time = (time.time() - start_time) * 1000
-            error_type = type(e).__name__
-            
-            # Provide more detailed error information
-            if isinstance(e, requests.exceptions.Timeout):
-                error_msg = f"Request to {url} timed out after 30 seconds"
-            elif isinstance(e, requests.exceptions.ConnectionError):
-                error_msg = f"Failed to connect to {url}: {str(e)}"
-            elif isinstance(e, requests.exceptions.HTTPError):
-                error_msg = f"HTTP error for {url}: {str(e)}"
-            else:
-                error_msg = f"Request to {url} failed: {str(e)}"
-            
-            logger.error(error_msg)
-            logger.debug(f"Error details: {error_type} - {str(e)}", exc_info=True)
-            return (response_time, 0, False, False, 0)
-    
-    def _log_request(self, operation: str, target: str, response_time: float,
-                    status_code: int, cache_hit: bool, data_size: int) -> None:
-        """
-        Record request metrics in the performance data store.
-        
-        This method stores the results of each request in a structured format
-        for later analysis and reporting.
-        
-        Args:
-            operation (str): The API endpoint or operation being tested
-            target (str): 'direct' or 'proxy' - indicates request path
-            response_time (float): Time taken for the request in milliseconds
-            status_code (int): HTTP status code of the response
-            cache_hit (bool): Whether the response came from cache
-            data_size (int): Size of the response data in bytes
-        """
-        # Log the request details at DEBUG level
-        logger.debug(f"Request logged - Operation: {operation}, Target: {target}, "
-                   f"Status: {status_code}, Time: {response_time:.2f}ms, "
-                   f"Cache: {'hit' if cache_hit else 'miss'}, Size: {data_size} bytes")
-        
-        # Store the metrics in the performance data dictionary
-        self.performance_data['operation'].append(operation)
-        self.performance_data['target'].append(target)
-        self.performance_data['response_time'].append(response_time)
-        self.performance_data['status_code'].append(status_code)
-        self.performance_data['timestamp'].append(datetime.now())
-        self.performance_data['cache_hit'].append(cache_hit)
-        self.performance_data['data_size'].append(data_size)
-    
-    def test_endpoint(self, endpoint: str, method: str = 'GET',
-                     data: Optional[dict] = None, num_requests: int = 10,
-                     run_concurrent: bool = True) -> Dict[str, Any]:
-        """
-        Test a specific API endpoint through both direct and proxy connections.
-        
-        This method performs load testing on the specified endpoint by sending multiple
-        requests through both direct and proxy paths, then collects and returns performance metrics.
-        
-        Args:
-            endpoint (str): The API endpoint to test (e.g., 'users', 'health')
-            method (str): HTTP method to use (GET, POST, etc.)
-            data (dict, optional): Request payload for POST/PUT methods
-            num_requests (int): Number of requests to send per target (direct/proxy)
-            run_concurrent (bool): Whether to run tests concurrently for better performance
-            
-        Returns:
-            dict: A dictionary containing detailed performance statistics for both
-                  direct and proxy requests, including:
-                  - avg_time: Average response time in milliseconds
-                  - min_time: Minimum response time
-                  - max_time: Maximum response time
-                  - p90: 90th percentile response time
-                  - success_rate: Percentage of successful requests
-                  - throughput: Requests per second
-        """
-        logger.info(f"Testing endpoint: {endpoint} ({method}) - {num_requests} requests per target (concurrent: {run_concurrent})")
-        
-        # Initialize results storage
-        results = {
-            'direct': {'times': [], 'success': 0, 'total': 0},
-            'proxy': {'times': [], 'success': 0, 'total': 0}
-        }
-        
-        # Construct full URLs for both direct and proxy requests
-        urls = {
-            'direct': f"{self.server_url}/{endpoint.lstrip('/')}",
-            'proxy': f"{self.proxy_url}/{endpoint.lstrip('/')}"
-        }
-        
-        def _test_single_request(target: str) -> Tuple[str, float, int, bool, bool, int]:
-            """
-            Inner function to perform a single request.
-            
-            Args:
-                target (str): 'direct' or 'proxy' - indicates which URL to test
-                
-            Returns:
-                Tuple containing target and request metrics
-            """
-            # Make the HTTP request and capture metrics
-            response_time, status_code, success, cache_hit, data_size = self._make_request(
-                urls[target], method, data, target=target
-            )
-            
-            # Log the request details
-            self._log_request(
-                operation=endpoint,
-                target=target,
-                response_time=response_time,
-                status_code=status_code,
-                cache_hit=cache_hit,
-                data_size=data_size
-            )
-            
-            return target, response_time, status_code, success, cache_hit, data_size
-        
-        # Execute tests either concurrently or sequentially
-        if run_concurrent:
-            logger.info(f"Running concurrent tests with up to 10 workers...")
-            # Create list of all requests to make
-            all_requests = []
-            for target in ['direct', 'proxy']:
-                for _ in range(num_requests):
-                    all_requests.append(target)
-            
-            # Use ThreadPoolExecutor for concurrent execution
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(all_requests))) as executor:
-                # Submit all requests
-                futures = [executor.submit(_test_single_request, target) for target in all_requests]
-                
-                # Process completed futures
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        target, response_time, status_code, success, cache_hit, data_size = future.result()
-                        
-                        # Update results
-                        results[target]['times'].append(response_time)
-                        results[target]['success'] += 1 if success else 0
-                        results[target]['total'] += 1
-                        
-                    except Exception as e:
-                        logger.error(f"Error in concurrent request: {str(e)}")
-                        # Continue with other tests even if one fails
-        else:
-            logger.info("Running sequential tests...")
-            # Run tests sequentially
-            for target in ['direct', 'proxy']:
-                for i in range(num_requests):
-                    try:
-                        _, response_time, status_code, success, cache_hit, data_size = _test_single_request(target)
-                        
-                        # Update results
-                        results[target]['times'].append(response_time)
-                        results[target]['success'] += 1 if success else 0
-                        results[target]['total'] += 1
-                        
-                        # Log progress for long-running tests
-                        if (i + 1) % 10 == 0 or (i + 1) == num_requests:
-                            logger.debug(f"Completed {i+1}/{num_requests} requests to {target}")
-                            
-                    except Exception as e:
-                        logger.error(f"Error in sequential request to {target}: {str(e)}")
-                        # Continue with next request
-        
-        # Calculate comprehensive statistics for the test run
-        stats = {}
-        for target in ['direct', 'proxy']:
-            if results[target]['times']:
-                times = results[target]['times']
-                success_rate = (results[target]['success'] / results[target]['total']) * 100
-                total_time = sum(times) / 1000  # Convert to seconds for throughput calculation
-                
-                stats[target] = {
-                    'avg_time': statistics.mean(times),  # Average response time in ms
-                    'min_time': min(times),             # Fastest response time in ms
-                    'max_time': max(times),             # Slowest response time in ms
-                    'p90': np.percentile(times, 90),    # 90th percentile response time in ms
-                    'success_rate': success_rate,        # Percentage of successful requests
-                    'throughput': len(times) / total_time if total_time > 0 else 0,  # req/s
-                    'total_requests': len(times),        # Total number of requests made
-                    'failed_requests': len(times) - results[target]['success']  # Failed requests
-                }
-                
-                # Log summary for this target
-                logger.info(
-                    f"{target.upper()} Results - "
-                    f"Avg: {stats[target]['avg_time']:.2f}ms, "
-                    f"Min: {stats[target]['min_time']:.2f}ms, "
-                    f"Max: {stats[target]['max_time']:.2f}ms, "
-                    f"Success: {stats[target]['success_rate']:.1f}%"
-                )
-        
-        return stats
-    
-    def generate_report(self) -> None:
-        """
-        Generate a simplified performance report with key metrics.
-        
-        This method processes the collected performance data to create:
-        1. Raw data CSV file
-        2. Basic summary statistics
-        3. Simple visualization plots
-        """
-        if not self.performance_data['operation']:
-            logger.warning("No performance data available to generate report")
-            return
-        
-        logger.info("Generating performance report...")
-        
-        try:
-            # Create output directory if it doesn't exist
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Create a DataFrame from the performance data
-            df = pd.DataFrame(self.performance_data)
-            
-            # 1. Save raw data to CSV
-            raw_data_path = self.output_dir / 'performance_data.csv'
-            df.to_csv(raw_data_path, index=False)
-            logger.info(f"Saved raw performance data to: {raw_data_path}")
-            
-            # 2. Calculate basic statistics
-            stats = []
-            for (operation, target), group in df.groupby(['operation', 'target']):
-                times = group['response_time']
-                success_rate = (group['status_code'] < 400).mean() * 100
-                
-                stats.append({
-                    'Operation': operation,
-                    'Target': target,
-                    'Requests': len(times),
-                    'Avg Time (ms)': f"{times.mean():.2f}",
-                    'Min (ms)': f"{times.min():.2f}",
-                    'Max (ms)': f"{times.max():.2f}",
-                    'Success %': f"{success_rate:.1f}"
-                })
-            
-            # Convert to DataFrame for nice formatting
-            summary = pd.DataFrame(stats)
-            
-            # Print summary to console
-            print("\n" + "="*70)
-            print("PERFORMANCE TEST SUMMARY".center(70))
-            print("="*70)
-            print(summary.to_string(index=False))
-            print("\nDetailed results saved to:", self.output_dir.absolute())
-            
-            # Save summary to CSV
-            summary_path = self.output_dir / 'summary_statistics.csv'
-            summary.to_csv(summary_path, index=False)
-            logger.info(f"Saved summary statistics to: {summary_path}")
-            
-            # Generate basic plots if possible
-            try:
-                self._generate_plots(df)
-            except Exception as e:
-                logger.warning(f"Could not generate plots: {str(e)}")
-            
-            logger.info("Report generation completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Error generating report: {str(e)}")
-            raise
-    
-    def _generate_plots(self, df: pd.DataFrame) -> None:
-        """Generate basic performance visualization plots."""
-        try:
-            plt.figure(figsize=(12, 6))
-            
-            # Simple response time comparison
-            plt.subplot(1, 2, 1)
-            sns.barplot(x='operation', y='response_time', hue='target', data=df, ci='sd')
-            plt.title('Average Response Time (ms)')
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            
-            # Save the figure
-            plot_path = self.output_dir / 'performance_summary.png'
-            plt.savefig(plot_path, dpi=120, bbox_inches='tight')
-            plt.close()
-            
-            logger.info(f"Saved performance summary plot to: {plot_path}")
-            
-        except Exception as e:
-            logger.warning(f"Could not generate plots: {str(e)}")
-            # Don't fail the whole report if plotting fails
-
-def parse_arguments():
-    """
-    Parse and validate command line arguments.
-    
-    Returns:
-        argparse.Namespace: Parsed command line arguments with the following attributes:
-            - server (str): Base URL of the backend server
-            - proxy (str): Base URL of the proxy server
-            - output (str): Output directory for test results
-            
-    Example:
-        $ python script.py --server http://localhost:3000 --proxy http://localhost:8080 --output results
-    """
-    parser = argparse.ArgumentParser(
-        description='Performance Testing Tool for Proxy Server Evaluation',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    # Server configuration arguments
-    parser.add_argument(
-        '--server', 
-        type=str, 
-        default='http://localhost:3000',
-        help='Base URL of the backend server (e.g., http://localhost:3000)'
-    )
-    
-    parser.add_argument(
-        '--proxy', 
-        type=str, 
-        default='http://localhost:8080',
-        help='Base URL of the proxy server (e.g., http://localhost:8080)'
-    )
-    
-    # Output configuration
-    parser.add_argument(
-        '--output', 
-        type=str, 
-        default='results',
-        help='Output directory for test results and reports'
-    )
-    
-    # Add concurrent execution flag
-    parser.add_argument(
-        '--concurrent',
-        action='store_true',
-        help='Run tests concurrently for better performance',
-        default=True
-    )
-    
-    # Parse and validate arguments
-    args = parser.parse_args()
-    
-    # Basic URL validation
-    for url in [args.server, args.proxy]:
-        if not (url.startswith('http://') or url.startswith('https://')):
-            parser.error(f"URL must start with 'http://' or 'https://': {url}")
-            
-    return args
-
-def test_large_request(server_url: str, proxy_url: str, num_requests: int = 3, size_mb: int = 10) -> list:
-    """
-    Test the performance of large file downloads through both direct and proxy connections.
-    
-    This function is specifically designed to measure:
-    - Download speeds for large files
-    - Memory usage during large transfers
-    - Caching effectiveness for large responses
-    
-    Args:
-        server_url (str): Base URL of the backend server
-        proxy_url (str): Base URL of the proxy server
-        num_requests (int): Number of times to repeat the test (default: 3)
-        size_mb (int): Size of the test file in megabytes (default: 10MB)
-        
-    Returns:
-        list: A list of dictionaries containing test results
-        
-    The test will download the specified file multiple times and report statistics
-    for both direct and proxied connections.
-    """
-    print(f"\n{'='*60}")
-    print(f"LARGE FILE DOWNLOAD TEST ({size_mb}MB)".center(60))
-    print(f"{'='*60}")
-    
-    # Initialize the tester with a dedicated output directory
-    tester = PerformanceTester(
-        server_url=server_url,
-        proxy_url=proxy_url,
-        output_dir=f"large_request_{size_mb}MB_results"
-    )
-    
-    # Track overall statistics
-    all_stats = []
-    
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        # Run the test multiple times to get consistent measurements
-        for i in range(num_requests):
-            print(f"\n--- Test Iteration {i+1}/{num_requests} ---")
-            print(f"Downloading {size_mb}MB file...")
-            
-            # Execute the test
-            stats = tester.test_endpoint(
-                endpoint=f"large?size={size_mb}",
-                method='GET',
-                num_requests=1,
-                run_concurrent=False  # Run sequentially for large downloads
-            )
-            
-            # Calculate download speed
-            for target, metrics in stats.items():
-                duration_s = metrics['avg_time'] / 1000  # Convert ms to seconds
-                size_mb_actual = metrics.get('data_size', 0) / (1024 * 1024)
-                mbps = (size_mb_actual * 8) / duration_s if duration_s > 0 else 0
-                
-                print(f"\n{target.upper()} Results:")
-                print(f"  Time: {metrics['avg_time']:,.2f} ms")
-                print(f"  Size: {size_mb_actual:,.2f} MB")
-                print(f"  Speed: {mbps:,.2f} Mbps")
-                
-                # Store for final summary
-                all_stats.append({
-                    'target': target,
-                    'iteration': i + 1,
-                    'time_ms': metrics['avg_time'],
-                    'size_mb': size_mb_actual,
-                    'speed_mbps': mbps
-                })
-    
-    except Exception as e:
-        print(f"\nError during large request test: {str(e)}")
-        logging.error("Large request test failed", exc_info=True)
-    
-    finally:
-        # Always generate a report, even if the test was interrupted
-        print("\nGenerating final report...")
-        tester.generate_report()
-        
-        # Print final summary
-        if all_stats:
-            print("\n" + "="*60)
-            print("LARGE FILE DOWNLOAD SUMMARY".center(60))
-            print("="*60)
-            
-            # Group by target (direct/proxy)
-            df = pd.DataFrame(all_stats)
-            
-            for target in ['direct', 'proxy']:
-                target_stats = df[df['target'] == target]
-                if len(target_stats) > 0:
-                    print(f"\n{target.upper()} AVERAGES (n={len(target_stats)}):")
-                    print(f"  Time: {target_stats['time_ms'].mean():,.2f} ms")
-                    print(f"  Size: {target_stats['size_mb'].mean():,.2f} MB")
-                    print(f"  Speed: {target_stats['speed_mbps'].mean():,.2f} Mbps")
-                    print(f"  Min Speed: {target_stats['speed_mbps'].min():,.2f} Mbps")
-                    print(f"  Max Speed: {target_stats['speed_mbps'].max():,.2f} Mbps")
-            # Print divider between target types
-            print("\n" + "-" * 60)
-    
-    return all_stats
+        time_taken = float(result.stdout.strip())
+    except ValueError:
+        time_taken = -1  # in case of parse errors
+    return time_taken
 
-def create_test_users(num_users: int = 5) -> List[Dict[str, Any]]:
-    """
-    Create a list of test user data for POST request testing.
-    
-    Args:
-        num_users (int): Number of test users to create
-        
-    Returns:
-        List[Dict[str, Any]]: List of user dictionaries with test data
-    """
-    users = []
-    for i in range(num_users):
-        users.append({
-            'id': f'test_user_{i}_{int(time.time())}',
-            'name': f'Test User {i+1}',
-            'email': f'test_user_{i}_{int(time.time())}@example.com',
-            'created_at': datetime.now().isoformat()
-        })
-    return users
+def test_endpoint(endpoint):
+    """Test single endpoint across backend & proxy with caching."""
+    path = endpoint["path"]
+    method = endpoint.get("method", "GET")
+    print(f"\n▶️ Testing {method} {path}")
+
+    backend_url = backend_base + path
+    proxy_url = proxy_base + path
+
+    # Backend Direct
+    backend_time = run_curl(backend_url, method, user_data if method == "POST" else None)
+
+    # Proxy First Call (Cache Miss)
+    proxy_time1 = run_curl(proxy_url, method, user_data if method == "POST" else None)
+
+    # Proxy Second Call (Cache Hit)
+    proxy_time2 = run_curl(proxy_url, method, user_data if method == "POST" else None)
+
+    return {
+        "endpoint": path,
+        "method": method,
+        "backend_time": backend_time,
+        "proxy_time_first": proxy_time1,
+        "proxy_time_second": proxy_time2
+    }
 
 def main():
-    """
-    Main entry point for the performance testing script.
-    
-    This function:
-    1. Parses command line arguments
-    2. Initializes the PerformanceTester
-    3. Runs a series of tests against the server and proxy
-    4. Generates reports and visualizations
-    5. Handles errors and user interrupts gracefully
-    
-    The script can be run with various command line arguments to customize the test:
-    $ python script.py --server http://localhost:3000 --proxy http://localhost:8080 --output results
-    """
-    try:
-        # Parse command line arguments
-        args = parse_arguments()
-        
-        # Initialize the tester with command line arguments
-        tester = PerformanceTester(
-            server_url=args.server,
-            proxy_url=args.proxy,
-            output_dir=args.output
-        )
-        
-        # Print test configuration
-        print("\n" + "="*60)
-        print("PROXY PERFORMANCE TESTING TOOL".center(60))
-        print("="*60)
-        print(f"Backend Server: {args.server}")
-        print(f"Proxy Server:   {args.proxy}")
-        print(f"Output Dir:     {args.output}")
-        print("-"*60)
-        
-        # Define test scenarios
-        test_cases = [
-            # Basic health check (lightweight)
-            {'endpoint': 'health', 'method': 'GET', 'data': None, 'requests': 10},
-            
-            # Standard API endpoint
-            {'endpoint': 'test', 'method': 'GET', 'data': None, 'requests': 20},
-            
-            # Large file download test
-            {
-                'endpoint': f'large?size=10',  # 10MB file
-                'method': 'GET',
-                'data': None,
-                'requests': 3,
-                'concurrent': False
-            },
-            
-            # POST request with data
-            {
-                'endpoint': 'users', 
-                'method': 'POST', 
-                'data': {
-                    'id': 'test_user_' + str(int(time.time())),
-                    'name': 'Test User',
-                    'email': f'test_{int(time.time())}@example.com'
-                },
-                'requests': 15
-            },
-            
-            # Large data endpoint (tests throughput)
-            {'endpoint': 'large', 'method': 'GET', 'data': None, 'requests': 5}
-        ]
-        
-        # Execute each test case
-        for i, test in enumerate(test_cases, 1):
-            print(f"\nTest {i}/{len(test_cases)}: {test['method']} {test['endpoint']}")
-            print("-" * 40)
-            
-            tester.test_endpoint(
-                endpoint=test['endpoint'],
-                method=test['method'],
-                data=test['data'],
-                num_requests=test['requests'],
-                run_concurrent=test.get('concurrent', args.concurrent)
-            )
-        
-        # Generate comprehensive report
-        print("\n" + "="*60)
-        print("GENERATING FINAL REPORT".center(60))
-        print("="*60)
-        tester.generate_report()
-        
-        print("\n" + "="*60)
-        print("TESTING COMPLETED SUCCESSFULLY".center(60))
-        print("="*60)
-        print(f"Results saved to: {Path(args.output).resolve()}")
-        
-    except KeyboardInterrupt:
-        print("\n\nTest interrupted by user. Partial results will be saved.")
-        if 'tester' in locals():
-            tester.generate_report()  # Save partial results
-        sys.exit(1)
-        
-    except Exception as e:
-        print(f"\n\nError during testing: {str(e)}")
-        logging.error("Unhandled exception", exc_info=True)
-        sys.exit(1)
+    print("=== 🚀 Full Proxy Benchmark Report ===")
+    all_results = []
+
+    # Pre-populate /users for DELETE test later
+    print("\n▶️ Setting up test user...")
+    run_curl(backend_base + "/users", method="POST", data=user_data)
+
+    for ep in endpoints:
+        result = test_endpoint(ep)
+        all_results.append(result)
+
+    # Clean-up: Delete test user
+    print("\n▶️ Cleaning up test user...")
+    run_curl(backend_base + "/users/123", method="DELETE")
+
+    # Report
+    print("\n=== 📊 Benchmark Results ===")
+    for result in all_results:
+        speedup = (result["proxy_time_first"] / result["proxy_time_second"]) if result["proxy_time_second"] > 0 else 0
+        print(f"\nEndpoint: {result['method']} {result['endpoint']}")
+        print(f"- Backend Time       : {result['backend_time']:.4f} sec")
+        print(f"- Proxy (1st, Miss)  : {result['proxy_time_first']:.4f} sec")
+        print(f"- Proxy (2nd, Hit)   : {result['proxy_time_second']:.4f} sec")
+        print(f"- Cache Speed-up     : {speedup:.1f}x")
 
 if __name__ == "__main__":
     main()
