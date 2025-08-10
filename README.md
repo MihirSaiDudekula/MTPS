@@ -5,6 +5,7 @@ A distributed system with components in different languages:
 - C proxy server
 - Node.js server
 
+![Architecture Diagram](https://github.com/MihirSaiDudekula/MTPS/MTPS_Architecture_Diagram.png)
 ## Project Structure
 
 ```
