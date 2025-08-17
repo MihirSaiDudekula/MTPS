@@ -144,6 +144,7 @@ typedef struct cache_element {
     int len;
     char* url;
     time_t lru_time_track;
+    struct cache_element* prev;
     struct cache_element* next;
 } cache_element;
 
@@ -151,7 +152,9 @@ pthread_t tid[MAX_CLIENTS];
 pthread_mutex_t cache_lock;
 sem_t connection_semaphore;
 cache_element* cache_head = NULL;
-int total_cache_size = 0;
+cache_element* cache_tail = NULL;
+size_t total_cache_size = 0;
+const size_t MAX_CACHE_SIZE = 200 * (1<<20); // 200MB
 
 // Function prototypes
 void parse_http_request(char* buffer, struct http_request* req);
@@ -293,31 +296,61 @@ int connect_to_server(const char* host, int port, int timeout_ms) {
     return server_socket;
 }
 
+// Remove a node from the cache
+static void remove_from_cache(cache_element* node) {
+    if (node->prev) {
+        node->prev->next = node->next;
+    } else {
+        cache_head = node->next;
+    }
+    
+    if (node->next) {
+        node->next->prev = node->prev;
+    } else {
+        cache_tail = node->prev;
+    }
+    
+    cache_stats.current_size -= node->len;
+    total_cache_size -= node->len;
+    free(node->url);
+    free(node->data);
+    free(node);
+}
+
+// Move a node to the front of the cache (MRU position)
+static void move_to_front(cache_element* node) {
+    if (node == cache_head) return; // Already at front
+    
+    // Remove from current position
+    if (node->prev) node->prev->next = node->next;
+    if (node->next) node->next->prev = node->prev;
+    
+    // Update tail if needed
+    if (node == cache_tail) {
+        cache_tail = node->prev;
+    }
+    
+    // Add to front
+    node->next = cache_head;
+    node->prev = NULL;
+    if (cache_head) {
+        cache_head->prev = node;
+    } else {
+        cache_tail = node; // First element in cache
+    }
+    cache_head = node;
+}
+
 void cache_invalidate(const char* url) {
     pthread_mutex_lock(&cache_lock);
     
-    cache_element* prev = NULL;
     cache_element* current = cache_head;
-    
     while (current) {
         if (strcmp(current->url, url) == 0) {
-            if (prev == NULL) {
-                cache_head = current->next;
-            } else {
-                prev->next = current->next;
-            }
-            
-            cache_stats.current_size -= current->len;
-            free(current->url);
-            free(current->data);
-            cache_element* to_free = current;
-            current = current->next;
-            free(to_free);
-            
+            remove_from_cache(current);
             safe_log("Invalidated cache for URL: %s", url);
-            continue;
+            break;
         }
-        prev = current;
         current = current->next;
     }
     
@@ -327,25 +360,20 @@ void cache_invalidate(const char* url) {
 bool cache_lookup(const char* url, cache_element** element) {
     pthread_mutex_lock(&cache_lock);
     
-    cache_element* prev = NULL;
     cache_element* current = cache_head;
     
     while (current) {
         if (strcmp(current->url, url) == 0) {
-            if (prev != NULL) {
-                prev->next = current->next;
-                current->next = cache_head;
-                cache_head = current;
-            }
+            // Move the found item to front (MRU position)
+            move_to_front(current);
+            current->lru_time_track = time(NULL);
             
             *element = current;
-            current->lru_time_track = time(NULL);
             pthread_mutex_unlock(&cache_lock);
             
             cache_stats.total_hits++;
             return true;
         }
-        prev = current;
         current = current->next;
     }
     
@@ -355,22 +383,62 @@ bool cache_lookup(const char* url, cache_element** element) {
 }
 
 void cache_add(const char* url, const char* data, size_t len) {
+    if (len > config.max_element_size) {
+        safe_log("Item too large for cache: %zu bytes (max: %zu)", len, config.max_element_size);
+        return;
+    }
+    
     pthread_mutex_lock(&cache_lock);
     
+    // Check if URL already exists in cache
+    cache_element* current = cache_head;
+    while (current) {
+        if (strcmp(current->url, url) == 0) {
+            // Update existing cache entry
+            if (current->len != len) {
+                // Size changed, need to reallocate
+                free(current->data);
+                current->data = malloc(len);
+                if (!current->data) {
+                    remove_from_cache(current);
+                    pthread_mutex_unlock(&cache_lock);
+                    return;
+                }
+                cache_stats.current_size += (len - current->len);
+                total_cache_size += (len - current->len);
+                current->len = len;
+            }
+            
+            memcpy(current->data, data, len);
+            current->lru_time_track = time(NULL);
+            move_to_front(current);
+            
+            pthread_mutex_unlock(&cache_lock);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Evict LRU items if needed
+    while (total_cache_size + len > MAX_CACHE_SIZE && cache_tail) {
+        safe_log("Evicting LRU item: %s", cache_tail->url);
+        remove_from_cache(cache_tail);
+    }
+    
+    // Create new cache element
     cache_element* new_element = malloc(sizeof(cache_element));
     if (!new_element) {
         LOG_ERROR("Memory allocation failed for cache element");
         pthread_mutex_unlock(&cache_lock);
         return;
     }
-
-    new_element->url = malloc(strlen(url) + 1);
+    
+    new_element->url = strdup(url);
     if (!new_element->url) {
         free(new_element);
         pthread_mutex_unlock(&cache_lock);
         return;
     }
-    strcpy(new_element->url, url);
     
     new_element->data = malloc(len);
     if (!new_element->data) {
@@ -379,13 +447,22 @@ void cache_add(const char* url, const char* data, size_t len) {
         pthread_mutex_unlock(&cache_lock);
         return;
     }
+    
     memcpy(new_element->data, data, len);
     new_element->len = len;
     new_element->lru_time_track = time(NULL);
+    new_element->prev = NULL;
     new_element->next = cache_head;
+    
+    if (cache_head) {
+        cache_head->prev = new_element;
+    } else {
+        cache_tail = new_element; // First element in cache
+    }
+    
     cache_head = new_element;
-
     cache_stats.current_size += len;
+    total_cache_size += len;
     
     pthread_mutex_unlock(&cache_lock);
 }
@@ -401,9 +478,12 @@ void cache_cleanup() {
         free(current);
         current = next;
     }
+    
     cache_head = NULL;
+    cache_tail = NULL;
     cache_stats.current_size = 0;
-
+    total_cache_size = 0;
+    
     pthread_mutex_unlock(&cache_lock);
 }
 
