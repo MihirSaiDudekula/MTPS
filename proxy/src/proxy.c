@@ -168,14 +168,19 @@ int send_error_response(int socket, int status_code, const char* message);
 
 // Fixed HTTP Request parsing
 void parse_http_request(char* buffer, struct http_request* req) {
+
+    // Initialize the request struct
     memset(req, 0, sizeof(struct http_request));
-    
+    // now our goal is to extract the text from the request and fill the request struct
+
+    // Check if the request is too large
     if (strlen(buffer) > MAX_BYTES - 1) {
         LOG_ERROR("Request too large");
         return;
     }
 
     // Parse request line: METHOD URL VERSION
+    // a reques usually looks like this: GET / HTTP/1.1, so we need to find the first \r\n
     char* line_end = strstr(buffer, "\r\n");
     if (!line_end) {
         LOG_ERROR("Invalid request format - no CRLF");
@@ -185,6 +190,8 @@ void parse_http_request(char* buffer, struct http_request* req) {
     *line_end = '\0'; // Temporarily null-terminate the first line
     
     // Parse method
+    // the request usually looks like this: GET / HTTP/1.1, so we need to find the first space
+    // the first space gives us the method
     char* space1 = strchr(buffer, ' ');
     if (!space1) {
         LOG_ERROR("Invalid request - no method");
@@ -203,6 +210,8 @@ void parse_http_request(char* buffer, struct http_request* req) {
     req->method[method_len] = '\0';
     
     // Parse URL
+    // the request usually looks like this: GET / HTTP/1.1, so we need to find the second space
+    // the second space gives us the URL
     char* url_start = space1 + 1;
     char* space2 = strchr(url_start, ' ');
     if (!space2) {
@@ -222,6 +231,8 @@ void parse_http_request(char* buffer, struct http_request* req) {
     req->url[url_len] = '\0';
     
     // Parse version
+    // the request usually looks like this: GET / HTTP/1.1, so we need to find the third space
+    // the third space gives us the version
     char* version_start = space2 + 1;
     size_t version_len = line_end - version_start;
     if (version_len >= sizeof(req->version)) {
@@ -248,26 +259,43 @@ void get_next_backend(const char** host, int* port) {
 }
 
 int connect_to_server(const char* host, int port, int timeout_ms) {
+    // establishes a TCP connection to a server using a hostname and port, with a specified timeout
     struct hostent *server;
+    // this is a special variable of hostent type which will store the details of our host
     struct sockaddr_in server_addr;
+    // this is a special variable of sockaddr_in type which will store the details of our server
     struct timeval timeout;
+    // this is a special variable of timeval type which will store the timeout value
     int server_socket;
+    // this is a special variable of int type which will store the socket descriptor
     
     timeout.tv_sec = timeout_ms / 1000;
     timeout.tv_usec = (timeout_ms % 1000) * 1000;
 
+    // gethostbyname is a function that returns a pointer to a hostent structure containing the host information, this is DNS lookup
     server = gethostbyname(host);
     if (!server) {
         LOG_ERROR("Could not resolve hostname");
         return -1;
     }
 
+    // Set a timeout for receiving data on the socket.
+    // If no data is received within the specified time (in 'timeout'), 
+    // the recv() call will fail with a timeout error instead of blocking indefinitely.
+
+    // Set socket options
+    // SOL_SOCKET stands for socket level option
+    // SO_RCVTIMEO used to set socket receive timeout
+    // (const char*)&timeout is the timeout value pointer
+    // socket is a function that creates a socket and returns a socket descriptor
+    // here were creating a socket IPv4 and TCP protocol
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         LOG_ERROR("Failed to create socket");
         return -1;
     }
 
+    // setsockopt is a function that sets the options for a socket, the options being set here are receive and send timeout
     if (setsockopt(server_socket, SOL_SOCKET, SO_RCVTIMEO, 
                   (const char*)&timeout, sizeof(timeout)) < 0) {
         LOG_ERROR("Failed to set receive timeout");
@@ -275,18 +303,25 @@ int connect_to_server(const char* host, int port, int timeout_ms) {
         return -1;
     }
 
+    // setsockopt is a function that sets the options for a socket, the options being set here are receive and send timeout
     if (setsockopt(server_socket, SOL_SOCKET, SO_SNDTIMEO, 
                   (const char*)&timeout, sizeof(timeout)) < 0) {
         LOG_ERROR("Failed to set send timeout");
         close(server_socket);
-        return -1;
+        return -1;          
     }
 
+    // Configure server address
+    // Fill the server_addr structure with zeroes and clear out any garbage values
+    // AF_INET is the address family for IPv4
+    // htons is used to convert the port number to network byte order
     memset(&server_addr, 0, sizeof(server_addr));
+    // specify IPv4 and port number, copy the IP address from the server into server_addr struct
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
 
+    // connect is a function that connects to a server
     if (connect(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         LOG_ERROR("Failed to connect to server");
         close(server_socket);
@@ -341,12 +376,16 @@ static void move_to_front(cache_element* node) {
     cache_head = node;
 }
 
+// Invalidate cache for a specific URL
+// we will be doing this when a post/put/delete request is received for that URL, because the data associated with that URL is modified
 void cache_invalidate(const char* url) {
     pthread_mutex_lock(&cache_lock);
-    
+
+    // we will traverse the cache linked list to find the element
     cache_element* current = cache_head;
     while (current) {
         if (strcmp(current->url, url) == 0) {
+            // remove the element from the cache , this is the equivalent of invalidating the cache
             remove_from_cache(current);
             safe_log("Invalidated cache for URL: %s", url);
             break;
@@ -358,19 +397,23 @@ void cache_invalidate(const char* url) {
 }
 
 bool cache_lookup(const char* url, cache_element** element) {
+
+    // we will use the cache_lock to ensure that the cache is not modified while we are looking up the cache
     pthread_mutex_lock(&cache_lock);
     
+
     cache_element* current = cache_head;
     
+    // we will traverse the cache linked list to find the element
     while (current) {
         if (strcmp(current->url, url) == 0) {
             // Move the found item to front (MRU position)
             move_to_front(current);
             current->lru_time_track = time(NULL);
-            
+
+            // we will return the element to the caller
             *element = current;
             pthread_mutex_unlock(&cache_lock);
-            
             cache_stats.total_hits++;
             return true;
         }
@@ -400,6 +443,7 @@ void cache_add(const char* url, const char* data, size_t len) {
                 free(current->data);
                 current->data = malloc(len);
                 if (!current->data) {
+                    // if we are unable to allocate memory, we will remove the element from the cache
                     remove_from_cache(current);
                     pthread_mutex_unlock(&cache_lock);
                     return;
@@ -409,6 +453,7 @@ void cache_add(const char* url, const char* data, size_t len) {
                 current->len = len;
             }
             
+            // update the data and the LRU time
             memcpy(current->data, data, len);
             current->lru_time_track = time(NULL);
             move_to_front(current);
@@ -416,6 +461,8 @@ void cache_add(const char* url, const char* data, size_t len) {
             pthread_mutex_unlock(&cache_lock);
             return;
         }
+
+        // move to the next element
         current = current->next;
     }
     
@@ -488,15 +535,24 @@ void cache_cleanup() {
 }
 
 void* handle_client(void* arg) {
+    // arg is a void* which is the socket file descriptor coming from accepting incoming client request
     int client_socket = *(int*)arg;
+    // free the arg, because we saved the value of the socket file descriptor in client_socket and now we don't need arg anymore
     free(arg);
 
+    // wait for a connection semaphore to be available, that is until the semaphore count is greater than 0
+    // semaphore count means the number of available connections
     sem_wait(&connection_semaphore);
 
+    // set the socket timeout to 30 seconds    
     struct timeval timeout;
     timeout.tv_sec = 30;
     timeout.tv_usec = 0;
 
+    // set the socket timeout for the client socket, this is to prevent the client from waiting for a response for a long time
+    // If no data is received in 30 seconds, the connection will be closed
+    // SOL_SOCKET is the level at which the option is defined, it is the socket level
+    // SOL_RCVTIMEO is the option name, it is the receive timeout, which means the time to wait for data to be received
     if (setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, 
                   (const char*)&timeout, sizeof(timeout)) < 0) {
         LOG_ERROR("Failed to set client socket timeout");
@@ -505,6 +561,7 @@ void* handle_client(void* arg) {
         return NULL;
     }
 
+    // receive the request from the client and store it in a buffer
     char buffer[MAX_BYTES];
     ssize_t bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
 
@@ -515,9 +572,11 @@ void* handle_client(void* arg) {
         return NULL;
     }
 
+    // null terminate the buffer
     buffer[bytes_received] = '\0';
     safe_log("Received request:\n%s", buffer);
 
+    // parse the request into the http_request struct
     struct http_request req;
     parse_http_request(buffer, &req);
 
@@ -531,12 +590,24 @@ void* handle_client(void* arg) {
     }
 
     // Check cache for GET requests
+
+    // cache_element_ptr is a pointer to the cache element, which is initially NULL
     cache_element* cache_element_ptr;
+
+    // if the request is a GET request and the URL is in the cache, send the cached response
     if (strcmp(req.method, "GET") == 0 && cache_lookup(req.url, &cache_element_ptr)) {
         safe_log("Cache hit for URL: %s", req.url);
+        
+        // send the cached response to the client
         send(client_socket, cache_element_ptr->data, cache_element_ptr->len, 0);
+        
+        // close the client socket
         close(client_socket);
+        
+        // release the connection semaphore
         sem_post(&connection_semaphore);
+        
+        // return NULL to exit the thread
         return NULL;
     }
 
@@ -588,13 +659,20 @@ void* handle_client(void* arg) {
     }
 
     // Receive and forward response
-    char response_buffer[MAX_BYTES];
-    char* full_response = NULL;
-    size_t total_received = 0;
-    size_t allocated_size = 0;
+
+    // response_buffer is a buffer to store the response from the server
+    char response_buffer[MAX_BYTES]; 
+    // full_response is a pointer to the full response from the server
+    char* full_response = NULL;    
+    // total_received is the total number of bytes received from the server
+    size_t total_received = 0;    
+    // allocated_size is the total number of bytes allocated for the full response
+    size_t allocated_size = 0;    
+    // should_cache is a boolean indicating whether the response should be cached
     bool should_cache = (strcmp(req.method, "GET") == 0);
     
     while (true) {
+        // receive the response from the server
         ssize_t bytes = recv(server_socket, response_buffer, sizeof(response_buffer), 0);
         if (bytes <= 0) break;
         
@@ -692,15 +770,19 @@ void handle_signal(int sig) {
 }
 
 int main(int argc, char* argv[]) {
+    // Set up signal handlers for graceful shutdown   
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
     if (argc != 2) {
+        // we need to provide the port number along with the program name as ./proxy <port_number>
         printf("Usage: %s <port_number>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
     int port = atoi(argv[1]);
+    // check if the port number is valid using
+    // atoi is used for converting the string to integer
     if (port <= 0 || port > 65535) {
         printf("Invalid port number. Use 1-65535\n");
         exit(EXIT_FAILURE);
@@ -708,9 +790,13 @@ int main(int argc, char* argv[]) {
 
     config.port = port;
 
+    // initialize the semaphore and mutex
     sem_init(&connection_semaphore, 0, MAX_CLIENTS);
     pthread_mutex_init(&cache_lock, NULL);
 
+    // create the server socket
+    // A server must set up a socket in advance — before any client can connect. 
+    // This is how the operating system knows the server is available to accept incoming connections.
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         perror("Failed to create socket");
@@ -718,18 +804,23 @@ int main(int argc, char* argv[]) {
     }
 
     int reuse = 1;
+    // Allows the port to be reused quickly after server restarts — prevents “Address already in use” errors.
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+    // describes how the server socket should behave — specifically, what kind of connections it's willing to accept.
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
+    // bind the server socket to the address 
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Binding failed");
         exit(EXIT_FAILURE);
     }
 
+    // listen for incoming connections
+    // The listen() function puts the server socket into a state where it can accept connections from clients.
     if (listen(server_socket, MAX_CLIENTS) < 0) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
@@ -738,15 +829,21 @@ int main(int argc, char* argv[]) {
     printf("Proxy server listening on port %d...\n", port);
     printf("Forwarding requests to %s:%d\n", config.target_host, config.target_port);
 
+
     while (keep_running) {
+        // sockaddr is a structure that contains the address of the client coming from the socket library
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
+        // accept the connection
+        
+        // client_socket is the socket descriptor for the client connection of the size of int, we malloc it because we need to pass it to the thread
         int* client_socket = malloc(sizeof(int));
         if (!client_socket) {
             continue;
         }
         
+        // The accept() function is used to accept a connection from a client.
         *client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
 
         if (*client_socket < 0) {
@@ -755,20 +852,32 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        // get the client's IP address
         char client_ip[INET_ADDRSTRLEN];
+
+        // convert the IP address to a string
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         printf("New connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
 
+        // create a thread to handle the client connection
+        
+        // thread_id is the id of the thread
         pthread_t thread_id;
+        
+        // pthread_create is used to create a thread, it takes 4 arguments, the first is the thread id, the second is the attributes of the thread, the third is the function to be executed by the thread, the fourth is the argument to the function
+        // the reason why we use a thread for a socket here is to handle multiple clients at the same time
         if (pthread_create(&thread_id, NULL, handle_client, (void*)client_socket) != 0) {
             perror("Thread creation failed");
             close(*client_socket);
             free(client_socket);
             continue;
         }
+        
+        // pthread_detach is used to detach the thread, so that it can run independently
         pthread_detach(thread_id);
     }
 
+    // cleanup resources, close the socket, destroy the semaphore and mutex
     close(server_socket);
     cache_cleanup();
     sem_destroy(&connection_semaphore);
