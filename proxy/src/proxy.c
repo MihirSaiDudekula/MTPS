@@ -29,6 +29,30 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+// Send all data, handling partial sends and retries
+static ssize_t send_all(int sockfd, const void *buf, size_t len, int flags) {
+    size_t total_sent = 0;
+    const char *ptr = (const char *)buf;
+    
+    while (total_sent < len) {
+        ssize_t sent = send(sockfd, ptr + total_sent, len - total_sent, flags);
+        if (sent < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Wait a bit before retrying
+                struct timespec ts = {.tv_sec = 0, .tv_nsec = 10000000}; // 10ms
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            return -1; // Error
+        }
+        if (sent == 0) {
+            break; // Connection closed
+        }
+        total_sent += sent;
+    }
+    return total_sent;
+}
+
 // Define strcasestr if not available
 #ifndef _GNU_SOURCE
 char* strcasestr(const char* haystack, const char* needle) {
@@ -568,22 +592,119 @@ void* handle_client(void* arg) {
         return NULL;
     }
 
-    // receive the request from the client and store it in a buffer
-    char buffer[MAX_BYTES];
-    ssize_t bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+    // Receive the complete request, handling partial receives
+    char *buffer = NULL;
+    size_t total_received = 0;
+    size_t buffer_size = MAX_BYTES;
+    ssize_t bytes_received;
+    char *header_end = NULL;
+    size_t content_length = 0;
+    bool headers_complete = false;
+    bool has_body = false;
 
-    if (bytes_received <= 0) {
-        LOG_ERROR("Failed to receive data from client");
+    // Allocate initial buffer
+    buffer = malloc(buffer_size);
+    if (!buffer) {
+        LOG_ERROR("Memory allocation failed");
+        send_error_response(client_socket, 500, "Internal Server Error");
         close(client_socket);
         sem_post(&connection_semaphore);
         return NULL;
     }
 
-    // null terminate the buffer
-    buffer[bytes_received] = '\0';
-    safe_log("Received request:\n%s", buffer);
+    // Read until we have all headers
+    while (!headers_complete) {
+        // Ensure we have space for at least one more byte and null terminator
+        if (total_received >= buffer_size - 1) {
+            buffer_size *= 2;
+            char *new_buf = realloc(buffer, buffer_size);
+            if (!new_buf) {
+                LOG_ERROR("Failed to reallocate buffer");
+                free(buffer);
+                send_error_response(client_socket, 500, "Internal Server Error");
+                close(client_socket);
+                sem_post(&connection_semaphore);
+                return NULL;
+            }
+            buffer = new_buf;
+        }
 
-    // parse the request into the http_request struct
+        // Receive data
+        bytes_received = recv(client_socket, buffer + total_received, 
+                             buffer_size - total_received - 1, 0);
+        
+        if (bytes_received <= 0) {
+            if (bytes_received == 0) {
+                LOG_ERROR("Connection closed by client");
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOG_ERROR("Failed to receive data from client");
+            }
+            free(buffer);
+            close(client_socket);
+            sem_post(&connection_semaphore);
+            return NULL;
+        }
+
+        total_received += bytes_received;
+        buffer[total_received] = '\0';
+
+        // Check if we've received all headers
+        header_end = strstr(buffer, "\r\n\r\n");
+        if (header_end) {
+            headers_complete = true;
+            *header_end = '\0';  // Null-terminate headers for parsing
+            
+            // Check for Content-Length header if this is a POST/PUT request
+            char *content_length_ptr = strcasestr(buffer, "Content-Length:");
+            if (content_length_ptr) {
+                content_length = strtoul(content_length_ptr + 15, NULL, 10);
+                has_body = true;
+                
+                // Calculate how much of the body we've already received
+                size_t headers_len = (header_end + 4 - buffer);
+                size_t body_received = total_received - headers_len;
+                
+                // If we haven't received the full body yet, keep reading
+                if (body_received < content_length) {
+                    size_t remaining = content_length - body_received;
+                    // Ensure we have enough space for remaining body
+                    if (total_received + remaining >= buffer_size) {
+                        buffer_size = total_received + remaining + 1;
+                        char *new_buf = realloc(buffer, buffer_size);
+                        if (!new_buf) {
+                            LOG_ERROR("Failed to reallocate buffer for body");
+                            free(buffer);
+                            send_error_response(client_socket, 500, "Internal Server Error");
+                            close(client_socket);
+                            sem_post(&connection_semaphore);
+                            return NULL;
+                        }
+                        buffer = new_buf;
+                    }
+                    
+                    // Read remaining body
+                    while (remaining > 0) {
+                        bytes_received = recv(client_socket, buffer + total_received, 
+                                           remaining, 0);
+                        if (bytes_received <= 0) {
+                            LOG_ERROR("Failed to receive complete request body");
+                            free(buffer);
+                            close(client_socket);
+                            sem_post(&connection_semaphore);
+                            return NULL;
+                        }
+                        total_received += bytes_received;
+                        remaining -= bytes_received;
+                    }
+                    buffer[total_received] = '\0';
+                }
+            }
+        }
+    }
+
+    safe_log("Received complete request (%zu bytes)", total_received);
+
+    // Parse the request
     struct http_request req;
     parse_http_request(buffer, &req);
 
@@ -599,23 +720,47 @@ void* handle_client(void* arg) {
     // Check cache for GET requests
 
     // cache_element_ptr is a pointer to the cache element, which is initially NULL
-    cache_element* cache_element_ptr;
+    cache_element* cache_element_ptr = NULL;
+    char *cached_data = NULL;
+    size_t cached_len = 0;
 
     // if the request is a GET request and the URL is in the cache, send the cached response
     if (strcmp(req.method, "GET") == 0 && cache_lookup(req.url, &cache_element_ptr)) {
         safe_log("Cache hit for URL: %s", req.url);
         
-        // send the cached response to the client
-        send(client_socket, cache_element_ptr->data, cache_element_ptr->len, 0);
+        // Make a copy of the cached data while holding the lock
+        if (cache_element_ptr && cache_element_ptr->data && cache_element_ptr->len > 0) {
+            cached_data = malloc(cache_element_ptr->len);
+            if (cached_data) {
+                memcpy(cached_data, cache_element_ptr->data, cache_element_ptr->len);
+                cached_len = cache_element_ptr->len;
+            }
+        }
         
-        // close the client socket
-        close(client_socket);
+        // Release the cache lock by calling cache_lookup with NULL to indicate we're done
+        cache_element_ptr = NULL;
+        cache_lookup(NULL, &cache_element_ptr);
         
-        // release the connection semaphore
-        sem_post(&connection_semaphore);
-        
-        // return NULL to exit the thread
-        return NULL;
+        // If we have valid cached data, send it
+        if (cached_data && cached_len > 0) {
+            if (send_all(client_socket, cached_data, cached_len, 0) < 0) {
+                LOG_ERROR("Failed to send cached response to client");
+            }
+            free(cached_data);
+            
+            // close the client socket
+            close(client_socket);
+            
+            // release the connection semaphore
+            sem_post(&connection_semaphore);
+            
+            // return NULL to exit the thread
+            return NULL;
+        } else {
+            // If we got here, we had a cache miss or error
+            free(cached_data);
+            cached_data = NULL;
+        }
     }
 
     // Invalidate cache for modifying requests
@@ -655,79 +800,142 @@ void* handle_client(void* arg) {
         return NULL;
     }
 
-    // Forward request to target server
-    if (send(server_socket, buffer, bytes_received, 0) < 0) {
-        LOG_ERROR("Failed to send request to target server");
-        send_error_response(client_socket, 500, "Internal Server Error");
+    // Forward request to target server using send_all to handle partial sends
+    if (send_all(server_socket, buffer, total_received, 0) < 0) {
+        LOG_ERROR("Failed to send complete request to target server");
+        send_error_response(client_socket, 502, "Bad Gateway");
         close(server_socket);
         close(client_socket);
+        free(buffer);
         sem_post(&connection_semaphore);
         return NULL;
     }
+    free(buffer);  // Free request buffer as it's no longer needed
 
     // Receive and forward response
-
-    // response_buffer is a buffer to store the response from the server
-    char response_buffer[MAX_BYTES]; 
-    // full_response is a pointer to the full response from the server
-    char* full_response = NULL;    
-    // total_received is the total number of bytes received from the server
-    size_t total_received = 0;    
-    // allocated_size is the total number of bytes allocated for the full response
-    size_t allocated_size = 0;    
-    // should_cache is a boolean indicating whether the response should be cached
+    char *response_buffer = NULL;
+    size_t response_size = 0;
+    size_t response_allocated = 0;
     bool should_cache = (strcmp(req.method, "GET") == 0);
+    bool cacheable = false;
+    bool chunked = false;
+    size_t content_length = 0;
+    bool headers_received = false;
+    char *header_end = NULL;
+    
+    // Initial receive buffer
+    char recv_buf[8192];
     
     while (true) {
-        // receive the response from the server
-        ssize_t bytes = recv(server_socket, response_buffer, sizeof(response_buffer), 0);
-        if (bytes <= 0) break;
-        
-        // Send to client
-        if (send(client_socket, response_buffer, bytes, 0) < 0) {
-            LOG_ERROR("Failed to send to client");
+        // Receive data from server
+        ssize_t bytes = recv(server_socket, recv_buf, sizeof(recv_buf), 0);
+        if (bytes <= 0) {
+            if (bytes == 0) {
+                safe_log("Server closed connection");
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOG_ERROR("Error receiving from server");
+            }
             break;
         }
         
-        // Cache GET responses
-        // we will cache the response if the request is a GET request and the response is not too large
-        if (should_cache && (total_received + bytes) <= config.max_element_size) {
-            // we will reallocate the full_response buffer if needed
-            if (total_received + bytes > allocated_size) {
-                size_t new_size = total_received + bytes + MAX_BYTES;
-                char* new_buf = realloc(full_response, new_size);
-                if (!new_buf) {
-                    LOG_ERROR("Memory allocation failed for response caching");
-                    should_cache = false;
-                    free(full_response);
-                    full_response = NULL;
-                } else {
-                    full_response = new_buf;
-                    allocated_size = new_size;
-                }
+        // Forward to client first (low latency)
+        if (send_all(client_socket, recv_buf, bytes, 0) < 0) {
+            LOG_ERROR("Failed to send complete response to client");
+            break;
+        }
+        
+        // If we're not caching, continue to next chunk
+        if (!should_cache) continue;
+        
+        // Ensure we have enough space in the response buffer
+        if (response_size + bytes > response_allocated) {
+            size_t new_size = response_size + bytes + 8192;  // Extra space for next read
+            char *new_buf = realloc(response_buffer, new_size);
+            if (!new_buf) {
+                LOG_ERROR("Failed to allocate memory for response");
+                should_cache = false;
+                continue;
             }
-            
-            // we will copy the response buffer to the full_response buffer
-            if (should_cache) {
-                memcpy(full_response + total_received, response_buffer, bytes);
+            response_buffer = new_buf;
+            response_allocated = new_size;
+        }
+        
+        // Append received data to response buffer
+        memcpy(response_buffer + response_size, recv_buf, bytes);
+        response_size += bytes;
+        
+        // Process headers if we haven't already
+        if (!headers_received) {
+            header_end = strstr(response_buffer, "\r\n\r\n");
+            if (header_end) {
+                headers_received = true;
+                char *headers = response_buffer;
+                *header_end = '\0';  // Null-terminate headers for parsing
+                
+                // Check if this is a cacheable response
+                if (strstr(headers, "HTTP/1.1 200 ") || strstr(headers, "HTTP/1.0 200 ")) {
+                    // Check for Transfer-Encoding: chunked
+                    chunked = (strcasestr(headers, "Transfer-Encoding: chunked") != NULL);
+                    
+                    // Get Content-Length if not chunked
+                    if (!chunked) {
+                        char *cl_header = strcasestr(headers, "Content-Length:");
+                        if (cl_header) {
+                            content_length = strtoul(cl_header + 15, NULL, 10);
+                            cacheable = true;
+                            safe_log("Caching enabled, content length: %zu", content_length);
+                        }
+                    } else {
+                        // Don't cache chunked responses for simplicity
+                        should_cache = false;
+                        safe_log("Not caching chunked response");
+                    }
+                } else {
+                    // Only cache 200 OK responses
+                    should_cache = false;
+                }
+                
+                // Restore the original data
+                *header_end = '\r';
             }
         }
         
-        // we will update the total received bytes
-        total_received += bytes;
+        // If we know the content length, check if we've received everything
+        if (cacheable && !chunked && response_size >= (header_end - response_buffer) + 4 + content_length) {
+            safe_log("Received complete response, size: %zu", response_size);
+            break;  // Received complete response
+        }
     }
     
-    // Cache successful GET responses
-    if (should_cache && total_received > 0 && full_response) {
-        if (strncmp(full_response, "HTTP/1.", 7) == 0) {
-            int status_code = atoi(full_response + 9);
-            if (status_code >= 200 && status_code < 300) {
-
-                // the response is added to the cache if the status code is between 200 and 299 which means the request was successful
-                cache_add(req.url, full_response, total_received);
-                safe_log("Cached response for URL: %s", req.url);
+    // Cache the response if it's complete and cacheable
+    if (should_cache && cacheable && response_buffer) {
+        // Verify we have the complete response
+        size_t headers_len = (header_end - response_buffer) + 4;  // +4 for \r\n\r\n
+        // Only cache if we have the complete response
+        if (response_size >= headers_len + content_length) {
+            // Only cache if the response is within size limits
+            if (response_size <= config.max_element_size) {
+                // Make a copy of the response for the cache
+                char *response_copy = malloc(response_size);
+                if (response_copy) {
+                    memcpy(response_copy, response_buffer, response_size);
+                    cache_add(req.url, response_copy, response_size);
+                    safe_log("Cached response for URL: %s (%zu bytes)", req.url, response_size);
+                    // Don't free response_copy - it's now owned by the cache
+                } else {
+                    LOG_ERROR("Failed to allocate memory for cache copy");
+                }
+            } else {
+                safe_log("Response too large to cache: %zu bytes", response_size);
             }
+        } else {
+            safe_log("Incomplete response received, not caching");
         }
+    }
+    
+    // Clean up
+    if (response_buffer) {
+        free(response_buffer);
     }
     
     if (full_response) {
