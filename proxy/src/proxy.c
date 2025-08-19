@@ -258,6 +258,12 @@ void get_next_backend(const char** host, int* port) {
     pthread_mutex_unlock(&backend_lock);
 }
 
+// establishes a TCP connection from the proxy server to a backend/origin server
+// host: The hostname or IP address of the backend server to connect to
+// port: The port number of the backend server to connect to
+// timeout_ms: The timeout in milliseconds for the connection attempt
+// returns the socket descriptor of the connection, or -1 on failure
+
 int connect_to_server(const char* host, int port, int timeout_ms) {
     // establishes a TCP connection to a server using a hostname and port, with a specified timeout
     struct hostent *server;
@@ -411,7 +417,8 @@ bool cache_lookup(const char* url, cache_element** element) {
             move_to_front(current);
             current->lru_time_track = time(NULL);
 
-            // we will return the element to the caller
+            // we will return the element to the caller, this is like pass by reference
+            // although im returning true, im also returning the element pointer in the form of element reference
             *element = current;
             pthread_mutex_unlock(&cache_lock);
             cache_stats.total_hits++;
@@ -683,7 +690,9 @@ void* handle_client(void* arg) {
         }
         
         // Cache GET responses
+        // we will cache the response if the request is a GET request and the response is not too large
         if (should_cache && (total_received + bytes) <= config.max_element_size) {
+            // we will reallocate the full_response buffer if needed
             if (total_received + bytes > allocated_size) {
                 size_t new_size = total_received + bytes + MAX_BYTES;
                 char* new_buf = realloc(full_response, new_size);
@@ -698,11 +707,13 @@ void* handle_client(void* arg) {
                 }
             }
             
+            // we will copy the response buffer to the full_response buffer
             if (should_cache) {
                 memcpy(full_response + total_received, response_buffer, bytes);
             }
         }
         
+        // we will update the total received bytes
         total_received += bytes;
     }
     
@@ -711,6 +722,8 @@ void* handle_client(void* arg) {
         if (strncmp(full_response, "HTTP/1.", 7) == 0) {
             int status_code = atoi(full_response + 9);
             if (status_code >= 200 && status_code < 300) {
+
+                // the response is added to the cache if the status code is between 200 and 299 which means the request was successful
                 cache_add(req.url, full_response, total_received);
                 safe_log("Cached response for URL: %s", req.url);
             }
@@ -798,6 +811,11 @@ int main(int argc, char* argv[]) {
     // A server must set up a socket in advance — before any client can connect. 
     // This is how the operating system knows the server is available to accept incoming connections.
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    // this is for clients
+    // AF_INET is the address family for IPv4
+    // SOCK_STREAM is the socket type for TCP
+    // 0 is the protocol, which is set to 0 for the default protocol
+
     if (server_socket < 0) {
         perror("Failed to create socket");
         exit(EXIT_FAILURE);
@@ -814,6 +832,10 @@ int main(int argc, char* argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
     // bind the server socket to the address 
+    // binds server_socket to listen on:
+    // All available network interfaces (INADDR_ANY)
+    // The specified port number (from command line arguments)
+    // This is the proxy's own address, not the client's or server's.
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Binding failed");
         exit(EXIT_FAILURE);
@@ -860,7 +882,7 @@ int main(int argc, char* argv[]) {
         printf("New connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
 
         // create a thread to handle the client connection
-        
+        // The code is using a multi-threaded approach where each client connection gets its own thread
         // thread_id is the id of the thread
         pthread_t thread_id;
         
